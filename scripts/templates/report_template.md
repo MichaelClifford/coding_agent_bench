@@ -20,6 +20,19 @@
 **Output Tokens:** {output_tokens} ({avg_output_per_task} avg per task)  
 **Cache Hit Rate:** {cache_hit_rate}%
 
+## vLLM Server Config
+  
+**Container Image:** {vllm_image}
+**Hardware:** <TODO>  
+**Model Max Len:** {vllm_max_model_len}  
+**Max Concurrency:** <TODO>  
+
+**Command:**
+
+```bash
+{vllm_command}
+```
+
 ## Harbor Config
 
 **Command:**

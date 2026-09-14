@@ -5,6 +5,8 @@ from pydantic import BaseModel, computed_field, model_validator
 from datetime import datetime
 import shlex
 
+from coding_agent_bench.models import MODEL_REGISTRY
+
 DEFAULT_GPU_COST_USD_PER_HOUR = 4
 
 
@@ -251,6 +253,23 @@ def format_time(seconds: int):
     m, s = divmod(m, 60)
     return f"{h:02d}h {m:02d}m {s:02d}s"
 
+def prettify_command(args: list[str]):
+    """Prettify a shell command with line breaks for easier reading."""
+    lines = []
+    i = 0
+
+    while i < len(args):
+        # If it's a flag and has a value next to it, keep them together
+        if args[i].startswith("-") and i + 1 < len(args) and not args[i+1].startswith("-"):
+            lines.append(f"{shlex.quote(args[i])} {shlex.quote(args[i+1])}")
+            i += 2
+        else:
+            lines.append(shlex.quote(args[i]))
+            i += 1
+
+    pretty_command = " \\\n  ".join(lines)
+    return pretty_command
+
 def create_job_report(job_dir: Path, metrics: Metrics, num_gpus: int = None, gpu_cost_per_hour: float = DEFAULT_GPU_COST_USD_PER_HOUR):
     report_template_path = Path(__file__).parent / "templates" / "report_template.md"
     report_template = report_template_path.read_text()
@@ -273,7 +292,7 @@ def create_job_report(job_dir: Path, metrics: Metrics, num_gpus: int = None, gpu
     dataset = "swe-bench/swe-bench-verified" if dataset == "datasets/swe-bench-verified" else dataset
     num_tasks = result_dict["n_total_trials"]
     environment = config_dict["environment"]["type"]
-    model = config_dict["agents"][0]["model_name"]
+    model = config_dict["agents"][0]["model_name"].replace("vllm/", "")
     harness = config_dict["agents"][0]["name"]
     job_name = config_dict["job_name"]
 
@@ -287,7 +306,7 @@ def create_job_report(job_dir: Path, metrics: Metrics, num_gpus: int = None, gpu
 
     # Create command string
     invocation_command = lock_dict.get("invocation")
-    command = shlex.join(invocation_command) if invocation_command else "<TODO>"
+    command = prettify_command(invocation_command) if invocation_command else "<TODO>"
 
     # Calculate time spent
     n_concurrent = config_dict["n_concurrent_trials"]
@@ -305,6 +324,17 @@ def create_job_report(job_dir: Path, metrics: Metrics, num_gpus: int = None, gpu
     
     # Show GPU calculation
     gpu_snippet = f"(${gpu_cost_per_hour} / GPU / hr * {num_gpus} GPU * {agent_time})" if num_gpus else ""
+    
+    # Get vLLM Info
+    model_config = MODEL_REGISTRY.get(model)
+    vllm_image = "<TODO>"
+    vllm_max_model_len = "<TODO>"
+    vllm_command = "<TODO>"
+    if model_config is not None:
+        vllm_image = model_config.image
+        vllm_max_model_len = model_config.model_max_len
+        vllm_command = ["vllm", "serve"] + model_config.args + model_config.default_args + ["--tensor-parallel-size", str(num_gpus)] if num_gpus else []
+        vllm_command = prettify_command(vllm_command)
     
     # Create report
     report = report_template.format(
@@ -330,6 +360,9 @@ def create_job_report(job_dir: Path, metrics: Metrics, num_gpus: int = None, gpu
         output_tokens=output_tokens,
         avg_output_per_task=avg_output_per_task,
         cache_hit_rate=cache_hit_rate,
+        vllm_image=vllm_image,
+        vllm_max_model_len=vllm_max_model_len,
+        vllm_command=vllm_command,
         command=command,
         config_json=config_json,
         result_json=result_json,
