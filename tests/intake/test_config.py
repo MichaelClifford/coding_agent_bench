@@ -32,6 +32,11 @@ def test_allowed_datasets_is_nonempty_set():
     assert len(ALLOWED_DATASETS) > 0
 
 
+def test_allowed_datasets_includes_rh_swe_bench():
+    """Allow the coding leaderboard's RH SWE-bench dataset."""
+    assert "rounakbende10/rh-swe-bench" in ALLOWED_DATASETS
+
+
 def test_column_enum_has_all_columns():
     """Keep the worksheet column schema complete."""
     expected = [

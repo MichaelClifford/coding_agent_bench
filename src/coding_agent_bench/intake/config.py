@@ -9,6 +9,7 @@ ALLOWED_AGENTS: set[str] = {a.value for a in SupportedAgent}
 ALLOWED_DATASETS: set[str] = {
     "swe-bench/swe-bench-verified",
     "scale-ai/swe-bench-pro",
+    "rounakbende10/rh-swe-bench",
 }
 
 AUTO_APPROVE: bool = os.environ.get("AUTO_APPROVE", "false").lower() == "true"
