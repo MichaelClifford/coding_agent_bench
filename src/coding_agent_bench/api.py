@@ -1486,13 +1486,18 @@ async def resume_job(job_id: str, req: ResumeJobRequest = ResumeJobRequest()):
         url_replace_step = _build_url_replace_shell_step(req.server_url, py_job_dir)
 
     shell_command = (
-        "mc alias set minio http://harbor-minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD"
-        f" && mc cp --recursive minio/results/{shlex.quote(original_job_name)}/ {job_dir}/"
+        "export AWS_ACCESS_KEY_ID=\"$MINIO_ROOT_USER\" "
+        "AWS_SECRET_ACCESS_KEY=\"$MINIO_ROOT_PASSWORD\" "
+        "AWS_DEFAULT_REGION=us-east-1 AWS_EC2_METADATA_DISABLED=true"
+        " && uv run --no-sync --no-cache aws --endpoint-url http://harbor-minio:9000"
+        f" s3 cp --recursive s3://results/{shlex.quote(original_job_name)}/ {job_dir}/"
         f"{_build_parent_env_shell_step(py_job_dir)}"
         f"{url_replace_step}"
         f" && uv run --no-sync --no-cache harbor jobs resume -p {job_dir}{filter_flags}"
-        f" ; mc rm --recursive --force minio/results/{shlex.quote(original_job_name)}/"
-        f" && mc cp --recursive {job_dir}/ minio/results/{shlex.quote(original_job_name)}/"
+        f" && uv run --no-sync --no-cache aws --endpoint-url http://harbor-minio:9000"
+        f" s3 rm --recursive s3://results/{shlex.quote(original_job_name)}/"
+        f" && uv run --no-sync --no-cache aws --endpoint-url http://harbor-minio:9000"
+        f" s3 cp --recursive {job_dir}/ s3://results/{shlex.quote(original_job_name)}/"
     )
 
     command = ["sh", "-c", shell_command]

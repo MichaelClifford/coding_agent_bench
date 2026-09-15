@@ -110,10 +110,17 @@ class OpenshiftJob:
                                 "args": [
                                     ("" if before_script is None else (shlex.join(before_script) + " && "))
                                     + "uv run --no-sync --no-cache "
-                                    + shlex.join(command) + ";"
-                                    + " mc alias set minio http://harbor-minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD"
-                                    + " && mc mb --ignore-existing minio/results"
-                                    + " && mc cp --recursive /app/jobs/ minio/results/"
+                                    + shlex.join(command) + " &&"
+                                    + " export AWS_ACCESS_KEY_ID=\"$MINIO_ROOT_USER\""
+                                    + " AWS_SECRET_ACCESS_KEY=\"$MINIO_ROOT_PASSWORD\""
+                                    + " AWS_DEFAULT_REGION=us-east-1"
+                                    + " AWS_EC2_METADATA_DISABLED=true"
+                                    + " && (uv run --no-sync --no-cache aws --endpoint-url http://harbor-minio:9000"
+                                    + " s3api head-bucket --bucket results >/dev/null 2>&1"
+                                    + " || uv run --no-sync --no-cache aws --endpoint-url http://harbor-minio:9000"
+                                    + " s3 mb s3://results)"
+                                    + " && uv run --no-sync --no-cache aws --endpoint-url http://harbor-minio:9000"
+                                    + " s3 cp --recursive /app/jobs/ s3://results/"
                                 ],
                                 "env": env,
                                 "volumeMounts": [{"name": "jobs", "mountPath": "/app/jobs"}],
