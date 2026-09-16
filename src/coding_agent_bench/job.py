@@ -5,6 +5,20 @@ import asyncio
 import json
 
 
+def _build_logged_shell_step(command: list[str], job_dir: str) -> str:
+    """Stream command output to the pod and console.log, retaining both exit codes.
+
+    The caller must use Bash and upload results before exiting with harbor_rc.
+    Append mode preserves console output from earlier resume attempts.
+    """
+    return (
+        f"mkdir -p {shlex.quote(job_dir)} || exit $?; "
+        f"{shlex.join(command)} 2>&1 | tee -a {shlex.quote(job_dir + '/console.log')}; "
+        'harbor_status=("${PIPESTATUS[@]}"); harbor_rc=${harbor_status[0]}; '
+        'if [ "$harbor_rc" -eq 0 ]; then harbor_rc=${harbor_status[1]}; fi;'
+    )
+
+
 class OpenshiftJob:
     @classmethod
     def preflight(cls) -> None:
@@ -49,7 +63,7 @@ class OpenshiftJob:
                                 "name": "harbor",
                                 "image": "ghcr.io/redhat-et/coding_agent_bench:latest",
                                 "imagePullPolicy": "Always",
-                                "command": ["sh", "-c"],
+                                "command": ["bash", "-c"],
                                 "args": [shell_command],
                                 "env": [
                                     {"name": "HOME", "value": "/tmp"},
@@ -72,6 +86,18 @@ class OpenshiftJob:
         before_script: list[str] = None,
         openrouter: bool = False,
     ) -> dict:
+        """Build a benchmark pod that logs output and uploads results before exit."""
+        # Queue pod names use the job UUID; artifacts use Harbor's --job-name.
+        artifact_name = self._job_name
+        for index, arg in enumerate(command):
+            if arg == "--job-name" and index + 1 < len(command):
+                artifact_name = command[index + 1]
+            elif arg.startswith("--job-name="):
+                artifact_name = arg.split("=", 1)[1]
+        logged_command = _build_logged_shell_step(
+            ["uv", "run", "--no-sync", "--no-cache", *command],
+            f"/app/jobs/{artifact_name}",
+        )
         # Only openrouter jobs need the OpenRouter key, so scope the secret to
         # them rather than exposing it to every job pod.
         env: list[dict] = [
@@ -106,12 +132,11 @@ class OpenshiftJob:
                                 "name": "harbor",
                                 "image": "ghcr.io/redhat-et/coding_agent_bench:latest",
                                 "imagePullPolicy": "Always",
-                                "command": ["sh", "-c"],
+                                "command": ["bash", "-c"],
                                 "args": [
                                     # Preserve partial results without hiding Harbor's failure.
                                     ("" if before_script is None else (shlex.join(before_script) + " || exit $?; "))
-                                    + "harbor_rc=0; uv run --no-sync --no-cache "
-                                    + shlex.join(command) + " || harbor_rc=$?;"
+                                    + logged_command
                                     + " export AWS_ACCESS_KEY_ID=\"$MINIO_ROOT_USER\""
                                     + " AWS_SECRET_ACCESS_KEY=\"$MINIO_ROOT_PASSWORD\""
                                     + " AWS_DEFAULT_REGION=us-east-1"

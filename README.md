@@ -184,6 +184,51 @@ commit in the job lock file for reproducibility.
 The queue service is a FastAPI application that can be deployed on OpenShift to queue and run benchmarks automatically.
 Benchmark results are stored to MinIO for later review.
 
+### Result uploads and console logs
+
+Job pods stream Harbor stdout and stderr to the pod logs and append them to
+`console.log` in the Harbor job directory. The file is uploaded alongside the
+job's `config.json` and `result.json` at `s3://results/<job-name>/console.log`.
+Resumes append to the downloaded log, preserving earlier attempts. The Bash
+pipeline captures Harbor and `tee` exit codes separately: a successful log or
+result upload does not turn a failed Harbor run into a successful job.
+
+Resume uploads retain recovery snapshots in a separate `results-staging` bucket,
+created automatically using the job pod's MinIO credentials:
+
+1. Download the existing job and prepare its configuration.
+2. Copy the existing remote results to
+   `s3://results-staging/<job-name>/<resume-job-id>/original/` before running Harbor.
+3. Run Harbor, then upload the entire local result directory (including
+   `console.log`) to the sibling `updated/` prefix, even if Harbor exits nonzero.
+4. Only after that upload succeeds, synchronize `updated/` to the canonical
+   `s3://results/<job-name>/` prefix with `--delete` to remove stale trial files.
+
+There is no delete-before-upload step. A failed backup or staged upload leaves
+the canonical results untouched. Promotion is not atomic across S3 objects, but
+both complete snapshots remain available if promotion fails or is interrupted.
+Snapshots are retained after successful promotions too; remove an attempt's
+staging prefix only after verifying that it is no longer needed.
+Each snapshot has a sibling `original.complete` or `updated.complete` marker,
+written only after the corresponding copy succeeds. An absent marker means
+that snapshot is not confirmed complete and must not be used for recovery.
+
+To retry a failed promotion, configure AWS credentials for MinIO and run from a
+shell with AWS CLI and access to the MinIO endpoint:
+
+```sh
+aws --endpoint-url http://harbor-minio:9000 s3api head-object \
+  --bucket results-staging --key "<job-name>/<resume-job-id>/updated.complete" && \
+aws --endpoint-url http://harbor-minio:9000 s3 sync --delete \
+  "s3://results-staging/<job-name>/<resume-job-id>/updated/" \
+  "s3://results/<job-name>/"
+```
+
+Use `original.complete` and `original/` instead to restore the previous results.
+A failure during the initial upload of new results can still leave new local
+artifacts unpersisted; durable local staging
+and upload-only retries are separate recovery work.
+
 ```mermaid
 sequenceDiagram
     Requestor->>Queue Service: Request Benchmark Run
