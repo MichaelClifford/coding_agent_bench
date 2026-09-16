@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "awscli>=1.46.1",
     "fastapi>=0.136.3",
     "google-api-python-client>=2.198.0",
     "google-auth>=2.56.3",
