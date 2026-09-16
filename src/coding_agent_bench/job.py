@@ -108,9 +108,10 @@ class OpenshiftJob:
                                 "imagePullPolicy": "Always",
                                 "command": ["sh", "-c"],
                                 "args": [
-                                    ("" if before_script is None else (shlex.join(before_script) + " && "))
-                                    + "uv run --no-sync --no-cache "
-                                    + shlex.join(command) + " &&"
+                                    # Preserve partial results without hiding Harbor's failure.
+                                    ("" if before_script is None else (shlex.join(before_script) + " || exit $?; "))
+                                    + "harbor_rc=0; uv run --no-sync --no-cache "
+                                    + shlex.join(command) + " || harbor_rc=$?;"
                                     + " export AWS_ACCESS_KEY_ID=\"$MINIO_ROOT_USER\""
                                     + " AWS_SECRET_ACCESS_KEY=\"$MINIO_ROOT_PASSWORD\""
                                     + " AWS_DEFAULT_REGION=us-east-1"
@@ -121,6 +122,7 @@ class OpenshiftJob:
                                     + " s3 mb s3://results)"
                                     + " && uv run --no-sync --no-cache aws --endpoint-url http://harbor-minio:9000"
                                     + " s3 cp --recursive /app/jobs/ s3://results/"
+                                    + " || exit $?; exit \"$harbor_rc\""
                                 ],
                                 "env": env,
                                 "volumeMounts": [{"name": "jobs", "mountPath": "/app/jobs"}],

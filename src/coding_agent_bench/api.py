@@ -947,7 +947,9 @@ async def _process_queued_job(queued: QueuedJob) -> None:
                     py_job_dir = f"/app/jobs/{orig_name}"
                     step = _build_url_replace_shell_step(real_url, py_job_dir)
                     command = list(command)
-                    command[2] = command[2].replace(" && uv run", f"{step} && uv run", 1)
+                    # AWS also uses uv run: update URLs only after restoring the config.
+                    parent_step = _build_parent_env_shell_step(py_job_dir)
+                    command[2] = command[2].replace(parent_step, parent_step + step, 1)
                 else:
                     command = [real_url if arg == server_url else arg for arg in command]
                 job_server_url = real_url
@@ -1493,11 +1495,15 @@ async def resume_job(job_id: str, req: ResumeJobRequest = ResumeJobRequest()):
         f" s3 cp --recursive s3://results/{shlex.quote(original_job_name)}/ {job_dir}/"
         f"{_build_parent_env_shell_step(py_job_dir)}"
         f"{url_replace_step}"
-        f" && uv run --no-sync --no-cache harbor jobs resume -p {job_dir}{filter_flags}"
-        f" && uv run --no-sync --no-cache aws --endpoint-url http://harbor-minio:9000"
+        # Failed restoration must never reach the remote-results removal below.
+        " || exit $?; harbor_rc=0;"
+        f" uv run --no-sync --no-cache harbor jobs resume -p {job_dir}{filter_flags}"
+        " || harbor_rc=$?;"
+        f" uv run --no-sync --no-cache aws --endpoint-url http://harbor-minio:9000"
         f" s3 rm --recursive s3://results/{shlex.quote(original_job_name)}/"
         f" && uv run --no-sync --no-cache aws --endpoint-url http://harbor-minio:9000"
         f" s3 cp --recursive {job_dir}/ s3://results/{shlex.quote(original_job_name)}/"
+        " || exit $?; exit \"$harbor_rc\""
     )
 
     command = ["sh", "-c", shell_command]
