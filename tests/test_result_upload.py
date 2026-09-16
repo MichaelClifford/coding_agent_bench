@@ -49,7 +49,7 @@ uv() {
 '''
 
 
-def run_shell(tmp_path, command, harbor_rc=0, fail_stage="", job_name=None):
+def run_shell(tmp_path, command, harbor_rc=0, fail_stage="", job_name=None, bucket_mode=""):
     """Run a pod script, retaining local and remote artifacts for assertions."""
     trace = tmp_path / "trace"
     remote = tmp_path / "remote"
@@ -71,6 +71,7 @@ def run_shell(tmp_path, command, harbor_rc=0, fail_stage="", job_name=None):
             "TRACE": str(trace),
             "HARBOR_RC": str(harbor_rc),
             "FAIL_STAGE": fail_stage,
+            "BUCKET_MODE": bucket_mode,
             "TEST_PYTHON": sys.executable,
             "FAKE_S3": str(Path(__file__).with_name("fake_s3.py")),
             "REMOTE_DIR": str(remote),
@@ -193,6 +194,38 @@ def test_missing_bucket_is_created_before_upload(tmp_path):
 
     assert status == 0
     assert calls == ["harbor", "head", "bucket", "upload"]
+
+
+@pytest.mark.parametrize("resume", [False, True])
+@pytest.mark.parametrize("bucket_mode", ["race", "unavailable"])
+@pytest.mark.parametrize("harbor_rc", [0, 7])
+def test_failed_bucket_create_rechecks_availability(
+    tmp_path, queue_api, resume, bucket_mode, harbor_rc
+):
+    """Accept a concurrently created bucket, but stop on a genuine outage."""
+    if resume:
+        command = enqueue_resume(queue_api).command[2]
+    else:
+        spec = OpenshiftJob("test")._job_spec(["harbor", "run"])
+        command = spec["spec"]["template"]["spec"]["containers"][0]["args"][0]
+
+    status, calls = run_shell(
+        tmp_path, command, harbor_rc=harbor_rc, bucket_mode=bucket_mode
+    )
+
+    head_index = calls.index("head")
+    assert calls[head_index:head_index + 3] == ["head", "bucket", "head"]
+    if bucket_mode == "race":
+        assert status == harbor_rc
+        assert "upload" in calls
+        if resume:
+            assert calls[-1] == "promote"
+    else:
+        assert status == 23
+        assert "upload" not in calls
+        assert "backup" not in calls
+        assert "promote" not in calls
+        assert calls[-1] == "head"
 
 
 def test_managed_resume_updates_url_after_download(tmp_path, queue_api, monkeypatch):

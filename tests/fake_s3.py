@@ -39,9 +39,17 @@ def main() -> int:
     with Path(os.environ["TRACE"]).open("a") as trace:
         trace.write(stage + "\n")
     fail = os.environ.get("FAIL_STAGE") == stage
+    bucket_mode = os.environ.get("BUCKET_MODE", "")
+    concurrent_create = Path(os.environ["REMOTE_DIR"]) / "concurrent-create"
     if stage == "head":
+        if bucket_mode:
+            return 0 if concurrent_create.exists() else 23
         return 23 if fail else 0
     if stage == "bucket":
+        if bucket_mode:
+            if bucket_mode == "race":
+                concurrent_create.touch()
+            return 23
         if not fail:
             resolve(args[0]).mkdir(parents=True, exist_ok=True)
         return 23 if fail else 0

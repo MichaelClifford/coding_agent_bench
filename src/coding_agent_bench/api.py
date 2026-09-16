@@ -1506,7 +1506,8 @@ async def resume_job(job_id: str, req: ResumeJobRequest = ResumeJobRequest()):
         f"{_build_parent_env_shell_step(py_job_dir)}"
         f"{url_replace_step}"
         f" && ({aws} s3api head-bucket --bucket results-staging >/dev/null 2>&1"
-        f" || {aws} s3 mb s3://results-staging)"
+        f" || {aws} s3 mb s3://results-staging"
+        f" || {aws} s3api head-bucket --bucket results-staging)"
         # Preserve the original before Harbor removes/retries local trial files.
         f" && {aws} s3 cp --recursive {results_uri} {original_uri}"
         f" && printf 'complete\\n' | {aws} s3 cp - {shlex.quote(staging_root + '/original.complete')}"

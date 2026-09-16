@@ -144,7 +144,10 @@ class OpenshiftJob:
                                     + " && (uv run --no-sync --no-cache aws --endpoint-url http://harbor-minio:9000"
                                     + " s3api head-bucket --bucket results >/dev/null 2>&1"
                                     + " || uv run --no-sync --no-cache aws --endpoint-url http://harbor-minio:9000"
-                                    + " s3 mb s3://results)"
+                                    + " s3 mb s3://results"
+                                    # A concurrent job may have created the bucket first.
+                                    + " || uv run --no-sync --no-cache aws --endpoint-url http://harbor-minio:9000"
+                                    + " s3api head-bucket --bucket results)"
                                     + " && uv run --no-sync --no-cache aws --endpoint-url http://harbor-minio:9000"
                                     + " s3 cp --recursive /app/jobs/ s3://results/"
                                     + " || exit $?; exit \"$harbor_rc\""
