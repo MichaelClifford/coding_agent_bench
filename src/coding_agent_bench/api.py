@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Header
 from fastapi.responses import HTMLResponse
 from fastapi.security import APIKeyHeader
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import NamedTuple, Optional
 
 import asyncio
@@ -23,6 +23,7 @@ from coding_agent_bench.providers import is_openrouter, resolve_provider, OPENRO
 from coding_agent_bench.agents import AGENT_REGISTRY
 from coding_agent_bench.ui import build_submit_form_html
 from coding_agent_bench import VERSION
+from coding_agent_bench.preemption import CANCELLED_ERROR_TYPE, PAUSE_PLUGIN
 
 import getpass
 import json
@@ -484,9 +485,18 @@ class CreateJobRequest(BaseModel):
 class ResumeJobRequest(BaseModel):
     filter_error_types: list[str] = Field(
         default_factory=list,
-        description="Error types to retry (e.g. RuntimeError). Empty = retry all errors",
+        description="Error types to retry. 'cancelled' maps to CancelledError; empty uses Harbor's cancellation default.",
     )
     server_url: Optional[str] = Field(None, description="New model server URL (replaces old URL across all job files)")
+
+    @field_validator("filter_error_types")
+    @classmethod
+    def normalize_cancelled_filter(cls, values: list[str]) -> list[str]:
+        """Map the human-facing cancellation filter to Harbor's exception name."""
+        return [
+            CANCELLED_ERROR_TYPE if value.strip().lower() in {"cancelled", "canceled", "cancellederror"}
+            else value for value in values
+        ]
 
 
 class CreateJobResponse(BaseModel):
@@ -537,7 +547,8 @@ class JobStore:
                 status TEXT NOT NULL DEFAULT 'queued',
                 error TEXT,
                 idempotency_key TEXT,
-                preempt_attempts INTEGER NOT NULL DEFAULT 0
+                preempt_attempts INTEGER NOT NULL DEFAULT 0,
+                pause_checkpointed INTEGER NOT NULL DEFAULT 0
             )"""
         )
         # Migrate columns when upgrading from an older schema.
@@ -548,6 +559,8 @@ class JobStore:
             conn.execute("ALTER TABLE jobs ADD COLUMN idempotency_key TEXT")
         if "preempt_attempts" not in columns:
             conn.execute("ALTER TABLE jobs ADD COLUMN preempt_attempts INTEGER NOT NULL DEFAULT 0")
+        if "pause_checkpointed" not in columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN pause_checkpointed INTEGER NOT NULL DEFAULT 0")
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotency_key "
             "ON jobs(idempotency_key) WHERE idempotency_key IS NOT NULL"
@@ -593,8 +606,10 @@ class JobStore:
         """Update the status of a job."""
         conn = self._connect()
         conn.execute(
-            "UPDATE jobs SET status = ?, error = ? WHERE job_id = ?",
-            (status.value, error, job_id),
+            "UPDATE jobs SET status = ?, error = ?, "
+            "pause_checkpointed = CASE WHEN ? = 'running' THEN 0 ELSE pause_checkpointed END "
+            "WHERE job_id = ?",
+            (status.value, error, status.value, job_id),
         )
         conn.commit()
         conn.close()
@@ -676,6 +691,23 @@ class JobStore:
         conn.close()
         return [dict(row) for row in rows]
 
+    def list_pausing(self) -> "list[dict]":
+        """Return checkpoints that need another non-destructive completion attempt."""
+        return self.list(JobStatus.PAUSING)
+
+    def mark_pause_checkpointed(self, job_id: str) -> bool:
+        """Persist successful upload before deleting the parent workload."""
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "UPDATE jobs SET pause_checkpointed = 1 WHERE job_id = ? AND status = ?",
+                (job_id, JobStatus.PAUSING.value),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
     def pause_commit(
         self,
         job_id: str,
@@ -692,7 +724,7 @@ class JobStore:
         try:
             cur = conn.execute(
                 "UPDATE jobs SET command = ?, status = ?, preempt_attempts = ?, error = ? "
-                "WHERE job_id = ? AND status = ?",
+                "WHERE job_id = ? AND status = ? AND pause_checkpointed = 1",
                 (
                     json.dumps(command),
                     JobStatus.PAUSED.value,
@@ -838,6 +870,12 @@ async def _resume_paused_jobs_loop():
         if _active_job is not None:
             continue  # never fight the serial queue for the shared instance
         try:
+            # A slow/failed upload must not be turned into a resumable checkpoint.
+            # Revisit retained parents after the worker's bounded wait expires.
+            for pending in job_store.list_pausing():
+                await _pause_commit(
+                    pending["job_id"], OpenshiftJob(pending["job_id"])
+                )
             rows = job_store.list_paused()
         except Exception:
             logger.exception("Paused job scan failed")
@@ -1036,25 +1074,23 @@ def _build_pause_resume_command(row: dict) -> list[str]:
     shell_command = _build_resume_shell_command(
         original_name,
         staging_id,
-        [],
+        [CANCELLED_ERROR_TYPE],
         server_url if _parse_nebius_url(server_url) is None else None,
     )
     return ["bash", "-c", shell_command]
 
 
 async def _pause_commit(job_id: str, oj: OpenshiftJob) -> bool:
-    """Checkpoint a preempted job to MinIO and park it as paused.
+    """Park only after cooperative cancellation and a confirmed checkpoint.
 
-    SIGTERMs harbor (bounded) so the pod script can finish its MinIO upload,
-    deletes the OpenShift Job and task pods, then atomically rewrites the row
-    into its resume command. Idempotent: safe to re-run after a crash, and it
-    refuses to touch jobs that already left the pausing state.
+    A timeout, failed upload, or missing parent leaves the row pausing and
+    retains local artifacts. The successful-upload bit survives a queue crash
+    between deleting the parent and committing the paused row.
     """
     row = job_store.get(job_id)
     if not row or row["status"] != JobStatus.PAUSING.value:
         return True
 
-    signal = False
     existing = None
     for attempt in range(1, CLEANUP_MAX_ATTEMPTS + 1):
         try:
@@ -1069,45 +1105,38 @@ async def _pause_commit(job_id: str, oj: OpenshiftJob) -> bool:
                 return False
             await asyncio.sleep(CLEANUP_RETRY_INTERVAL_SECONDS)
 
-    if existing is not None:
+    if not row.get("pause_checkpointed"):
         conditions = {
             condition.get("type")
-            for condition in existing.get("status", {}).get("conditions", [])
+            for condition in (existing or {}).get("status", {}).get("conditions", [])
             if condition.get("status") == "True"
         }
-        if not conditions.intersection({"Complete", "Failed"}):
-            signal = True
+        checkpointed = "Complete" in conditions
+        if existing is not None and not conditions.intersection({"Complete", "Failed"}):
+            try:
+                checkpointed = await oj.request_pause(
+                    row.get("error") or "Nebius model server was preempted",
+                    wait_seconds=PAUSE_UPLOAD_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                logger.exception("Cooperative pause request failed for %s", job_id)
+        if not checkpointed:
+            job_store.update_status_if(
+                job_id, JobStatus.PAUSING, JobStatus.PAUSING,
+                error="VM preempted; checkpoint not confirmed; parent Job retained for recovery",
+            )
+            return False
+        if not job_store.mark_pause_checkpointed(job_id):
+            return True  # A concurrent status transition won.
 
-    # Signal inline rather than via _best_effort_cleanup: the pod must be
-    # given the full upload budget before it is deleted, and cancel paths
-    # keep their original short 60s wait.
-    cleanup_errors: list[str] = []
-    checkpoint_note = ""
-    if signal:
-        try:
-            exited = await oj._signal_job_pod(wait_seconds=PAUSE_UPLOAD_TIMEOUT_SECONDS)
-        except Exception as e:
-            cleanup_errors.append(f"signal failed: {e}")
-            exited = False
-        if exited is False:
-            checkpoint_note = (
-                "; checkpoint upload may be incomplete (job pod outlived the pause budget)"
-            )
-            logger.error(
-                f"Job {job_id} pod did not exit within {PAUSE_UPLOAD_TIMEOUT_SECONDS}s; "
-                "deleting it may truncate the MinIO checkpoint"
-            )
     try:
         await oj._delete_job()
     except Exception as e:
-        cleanup_errors.append(f"delete failed: {e}")
-    cleanup_err = "; ".join(cleanup_errors) if cleanup_errors else None
-    if cleanup_err:
         job_store.update_status_if(
             job_id,
             JobStatus.PAUSING,
             JobStatus.PAUSING,
-            error=f"pause cleanup failed: {cleanup_err}",
+            error=f"pause cleanup failed: {e}",
         )
         return False
 
@@ -1117,10 +1146,16 @@ async def _pause_commit(job_id: str, oj: OpenshiftJob) -> bool:
         job_id,
         _build_pause_resume_command(row),
         attempts,
-        f"VM preempted — awaiting Nebius recovery{attempt_note}{checkpoint_note}",
+        f"VM preempted — awaiting Nebius recovery{attempt_note}",
     )
     if not parked:
         logger.info(f"Job {job_id} left the pausing state during finalize; skipping park")
+    elif MAX_PREEMPT_RESUMES > 0 and attempts > MAX_PREEMPT_RESUMES:
+        # Exhausting automatic retries must not skip cancellation/checkpointing.
+        job_store.update_status_if(
+            job_id, JobStatus.PAUSED, JobStatus.FAILED,
+            error=f"VM preempted repeatedly; exhausted {MAX_PREEMPT_RESUMES} auto-resume attempts; checkpoint saved for manual resume",
+        )
     return parked
 
 
@@ -1129,6 +1164,9 @@ async def _retry_pause_finalize(job_id: str, oj: OpenshiftJob) -> None:
     for attempt in range(1, CLEANUP_MAX_ATTEMPTS + 1):
         if await _pause_commit(job_id, oj):
             return
+        row = job_store.get(job_id)
+        if row and not row.get("pause_checkpointed"):
+            return  # Let the background loop revisit the retained parent later.
         logger.warning(
             f"Pause finalize attempt {attempt}/{CLEANUP_MAX_ATTEMPTS} failed for {job_id}"
         )
@@ -1136,18 +1174,12 @@ async def _retry_pause_finalize(job_id: str, oj: OpenshiftJob) -> None:
             await asyncio.sleep(CLEANUP_RETRY_INTERVAL_SECONDS)
 
     row = job_store.get(job_id)
-    logger.error(f"Pause finalize exhausted for {job_id}; parking anyway with error noted")
+    logger.error(f"Pause finalize exhausted for {job_id}; retaining parent and pausing state")
     if row and row["status"] == JobStatus.PAUSING.value:
-        new_attempts = int(row.get("preempt_attempts") or 0) + 1
-        attempt_note = f" (attempt {new_attempts}/{MAX_PREEMPT_RESUMES})" if MAX_PREEMPT_RESUMES else ""
-        parked = job_store.pause_commit(
-            job_id,
-            _build_pause_resume_command(row),
-            new_attempts,
-            f"VM preempted — parked after cleanup failure; resume may need manual attention{attempt_note}",
+        job_store.update_status_if(
+            job_id, JobStatus.PAUSING, JobStatus.PAUSING,
+            error="VM preempted; cleanup failure; parent retained and automatic resume deferred",
         )
-        if not parked:
-            logger.info(f"Job {job_id} left the pausing state during forced park; skipping")
 
 
 async def _handle_pause(job_id: str, oj: OpenshiftJob, nebius_instance_name: str | None) -> None:
@@ -1156,17 +1188,6 @@ async def _handle_pause(job_id: str, oj: OpenshiftJob, nebius_instance_name: str
     if not row:
         return
     attempts = int(row.get("preempt_attempts") or 0)
-    if attempts >= MAX_PREEMPT_RESUMES:
-        await _retry_terminal_job(
-            job_id,
-            oj,
-            JobStatus.FAILED,
-            error=f"VM preempted repeatedly; exhausted {MAX_PREEMPT_RESUMES} auto-resume attempts",
-        )
-        if nebius_instance_name and _nebius:
-            await _nebius.mark_job_completed(nebius_instance_name)
-        return
-
     if not job_store.update_status_if(
         job_id,
         JobStatus.RUNNING,
@@ -2085,6 +2106,7 @@ def _build_resume_shell_command(
     resume_command = [
         "uv", "run", "--no-sync", "--no-cache", "harbor", "jobs", "resume",
         "-p", py_job_dir,
+        "--plugin", PAUSE_PLUGIN,
     ]
     for error_type in filter_error_types:
         resume_command += ["-f", error_type]

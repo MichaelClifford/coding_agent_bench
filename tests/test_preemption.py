@@ -53,12 +53,18 @@ class FlowStore:
 
     def pause_commit(self, job_id, command, attempts, error):
         self.pause_commits.append((command, attempts, error))
-        if self.row["status"] != "pausing":
+        if self.row["status"] != "pausing" or not self.row.get("pause_checkpointed"):
             return False
         self.row["command"] = command
         self.row["status"] = "paused"
         self.row["preempt_attempts"] = attempts
         self.row["error"] = error
+        return True
+
+    def mark_pause_checkpointed(self, _job_id):
+        if self.row["status"] != "pausing":
+            return False
+        self.row["pause_checkpointed"] = 1
         return True
 
     def update_status_if(self, _job_id, expected, status, error=None):
@@ -108,6 +114,7 @@ class FlowJob:
         self.applied = 0
         self.deleted = 0
         self.signals = []
+        self.pauses = []
         self.ready_waits = 0
 
     def _job_spec(self, command, openrouter=False):
@@ -128,6 +135,10 @@ class FlowJob:
 
     async def _signal_job_pod(self, wait_seconds=60):
         self.signals.append(wait_seconds)
+        return self._signal_exited
+
+    async def request_pause(self, reason, wait_seconds=600):
+        self.pauses.append((reason, wait_seconds))
         return self._signal_exited
 
     async def _delete_job(self):
@@ -319,7 +330,8 @@ def test_pause_parks_job_with_resume_command_after_checkpoint_upload(monkeypatch
     asyncio.run(api._handle_pause("jid", oj, "cab-worker-0"))
 
     assert nebius.paused == ["cab-worker-0"]
-    assert oj.signals == [api.PAUSE_UPLOAD_TIMEOUT_SECONDS]  # long wait for MinIO upload
+    assert oj.signals == []  # Keep Harbor alive to write pending cancellations.
+    assert oj.pauses[0][1] == api.PAUSE_UPLOAD_TIMEOUT_SECONDS
     assert oj.deleted == 1
     assert store.row["status"] == "paused"
     assert store.row["preempt_attempts"] == 1
@@ -330,7 +342,7 @@ def test_pause_parks_job_with_resume_command_after_checkpoint_upload(monkeypatch
     assert "VM preempted" in store.row["error"]
 
 
-def test_pause_notes_incomplete_checkpoint_when_pod_outlives_budget(monkeypatch):
+def test_pause_retains_parent_when_pod_outlives_upload_budget(monkeypatch):
     from coding_agent_bench import api
 
     patch_sleep(monkeypatch)
@@ -344,10 +356,10 @@ def test_pause_notes_incomplete_checkpoint_when_pod_outlives_budget(monkeypatch)
 
     asyncio.run(api._handle_pause("jid", oj, "cab-worker-0"))
 
-    # The job still parks (recovery is still possible from the last snapshot),
-    # but the row must flag that the upload was truncated by the delete.
-    assert store.row["status"] == "paused"
-    assert "checkpoint upload may be incomplete" in store.row["error"]
+    assert store.row["status"] == "pausing"
+    assert "checkpoint not confirmed" in store.row["error"]
+    assert oj.deleted == 0
+    assert store.pause_commits == []
 
 
 def test_pause_budget_exhaustion_fails_job_without_parking(monkeypatch):
@@ -366,8 +378,9 @@ def test_pause_budget_exhaustion_fails_job_without_parking(monkeypatch):
 
     assert store.row["status"] == "failed"
     assert "exhausted" in store.row["error"]
-    assert store.pause_commits == []
-    assert nebius.completed == ["cab-worker-0"]
+    assert store.pause_commits  # Save the checkpoint even after exhausting retries.
+    assert store.row["pause_checkpointed"] == 1
+    assert nebius.paused == ["cab-worker-0"]
 
 
 def test_pause_skips_job_cancelled_during_detection(monkeypatch):
@@ -403,7 +416,7 @@ def test_pause_commit_skips_jobs_that_left_pausing(monkeypatch):
     assert oj.deleted == 0
 
 
-def test_pause_finalize_parks_even_when_cleanup_keeps_failing(monkeypatch):
+def test_pause_finalize_does_not_requeue_while_cleanup_keeps_failing(monkeypatch):
     from coding_agent_bench import api
 
     patch_sleep(monkeypatch)
@@ -411,16 +424,46 @@ def test_pause_finalize_parks_even_when_cleanup_keeps_failing(monkeypatch):
     store = FlowStore({
         "job_id": "jid", "job_name": "job-a", "agent": "a", "dataset": "d",
         "model_name": "m", "server_url": "nebius-b200", "status": "pausing",
-        "preempt_attempts": 1, "error": None,
+        "preempt_attempts": 1, "error": None, "pause_checkpointed": 1,
     })
     monkeypatch.setattr(api, "job_store", store)
     oj = FlowJob(job=None, delete_error=RuntimeError("oc api unreachable"))
 
     asyncio.run(api._retry_pause_finalize("jid", oj))
 
-    assert store.row["status"] == "paused"
+    assert store.row["status"] == "pausing"
     assert "cleanup failure" in store.row["error"]
-    assert store.row["preempt_attempts"] == 2
+    assert store.row["preempt_attempts"] == 1
+
+
+@pytest.mark.parametrize("job", [None, {"status": {"conditions": [{"type": "Failed", "status": "True"}]}}])
+def test_unconfirmed_checkpoint_is_never_deleted_or_parked(monkeypatch, job):
+    from coding_agent_bench import api
+
+    store = FlowStore({
+        "job_id": "jid", "job_name": "job-a", "status": "pausing",
+        "server_url": "nebius-b200", "preempt_attempts": 0, "error": "preempted",
+    })
+    oj = FlowJob(job=job)
+    monkeypatch.setattr(api, "job_store", store)
+    assert asyncio.run(api._pause_commit("jid", oj)) is False
+    assert oj.deleted == 0
+    assert not store.pause_commits
+    assert store.row["status"] == "pausing"
+
+
+def test_checkpoint_proof_survives_restart_after_parent_deletion(monkeypatch):
+    from coding_agent_bench import api
+
+    store = FlowStore({
+        "job_id": "jid", "job_name": "job-a", "status": "pausing",
+        "server_url": "nebius-b200", "preempt_attempts": 0, "error": "preempted",
+        "pause_checkpointed": 1,
+    })
+    monkeypatch.setattr(api, "job_store", store)
+    assert asyncio.run(api._pause_commit("jid", FlowJob(job=None))) is True
+    assert store.row["status"] == "paused"
+    assert "-f CancelledError" in store.row["command"][2]
 
 
 def test_paused_resume_command_reuses_original_artifact_and_placeholder():
@@ -546,6 +589,9 @@ class LoopStore:
 
     def list_paused(self):
         return [dict(r) for r in self._rows if r.get("status") == "paused"]
+
+    def list_pausing(self):
+        return [dict(r) for r in self._rows if r.get("status") == "pausing"]
 
     def update_status(self, job_id, status, error=None):
         self.status_updates.append((job_id, status.value, error))
@@ -996,6 +1042,8 @@ def test_job_store_pause_commit_state_machine(tmp_path):
     assert store.pause_commit("j1", ["bash", "-c", "x"], 1, "err") is False
 
     store.update_status("j1", api.JobStatus.PAUSING)
+    assert store.pause_commit("j1", ["bash", "-c", "x"], 1, "unconfirmed") is False
+    assert store.mark_pause_checkpointed("j1") is True
     assert store.pause_commit("j1", ["bash", "-c", "resume-cmd"], 1, "parked") is True
     row = store.get("j1")
     assert row["status"] == "paused"

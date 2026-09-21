@@ -6,6 +6,8 @@ import logging
 
 import json
 
+from coding_agent_bench.preemption import PAUSE_REQUEST_PATH
+
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +75,7 @@ class OpenshiftJob:
                                 "env": [
                                     {"name": "HOME", "value": "/tmp"},
                                     {"name": "HARBOR_PARENT", "value": self._pod_name},
+                                    {"name": "CAB_PAUSE_REQUEST_PATH", "value": PAUSE_REQUEST_PATH},
                                 ],
                                 "volumeMounts": [{"name": "jobs", "mountPath": "/app/jobs"}],
                                 "envFrom": [
@@ -107,6 +110,7 @@ class OpenshiftJob:
         # them rather than exposing it to every job pod.
         env: list[dict] = [
             {"name": "HARBOR_PARENT", "value": self._pod_name},
+            {"name": "CAB_PAUSE_REQUEST_PATH", "value": PAUSE_REQUEST_PATH},
         ]
         if openrouter:
             env.append(
@@ -236,6 +240,53 @@ class OpenshiftJob:
             return json.loads(stdout)
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"oc returned invalid JSON for job/{self._pod_name}") from exc
+
+    async def request_pause(self, reason: str, wait_seconds: int = 600) -> bool:
+        """Cancel trials cooperatively and wait for successful result upload.
+
+        Unlike user cancellation, a preemption must not kill the Harbor process
+        or parent pod: the plugin records pending trials and the shell uploads
+        them. False means the caller must retain the parent and retry later.
+        """
+        stdout, _ = await self._run_oc_command(
+            ["get", "pod", f"--selector=job-name={self._pod_name}", "-o", "json"],
+            timeout_sec=30,
+        )
+        pods = json.loads(stdout or "{}").get("items", [])
+        pod = next((p for p in pods if p.get("status", {}).get("phase") == "Running"), None)
+        if pod is None:
+            return False
+        environment = [
+            e for c in pod.get("spec", {}).get("containers", []) for e in c.get("env", [])
+        ]
+        if not any(e.get("name") == "CAB_PAUSE_REQUEST_PATH" for e in environment):
+            raise RuntimeError("Parent pod predates cooperative pause support; retaining it for manual recovery")
+        script = (
+            "import json, pathlib, datetime; "
+            f"path = pathlib.Path({PAUSE_REQUEST_PATH!r}); "
+            f"request = {{'reason': {reason!r}, "
+            "'requested_at': datetime.datetime.now(datetime.timezone.utc).isoformat()}; "
+            "temporary = path.with_suffix('.tmp'); "
+            "temporary.write_text(json.dumps(request)); temporary.replace(path)"
+        )
+        await self._run_oc_command(
+            ["exec", pod["metadata"]["name"], "-c", "harbor", "--", "python3", "-c", script],
+            timeout_sec=30,
+        )
+        deadline = asyncio.get_running_loop().time() + wait_seconds
+        while True:
+            job = await self._get_job()
+            conditions = {
+                c.get("type") for c in (job or {}).get("status", {}).get("conditions", [])
+                if c.get("status") == "True"
+            }
+            if "Complete" in conditions:
+                return True  # The shell reports success only after the S3 upload.
+            if "Failed" in conditions or job is None:
+                return False
+            if asyncio.get_running_loop().time() >= deadline:
+                return False
+            await asyncio.sleep(2)
 
     async def _signal_job_pod(self, wait_seconds: int = 60) -> bool | None:
         """Send SIGTERM to the harbor process inside the job pod so it
