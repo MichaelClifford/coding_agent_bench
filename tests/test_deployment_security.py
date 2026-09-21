@@ -19,9 +19,10 @@ def _deployment_objects() -> dict[str, dict]:
 
 
 def _intake_cronjob() -> dict:
-    """Return the intake CronJob manifest."""
+    """Return the intake CronJob object from its (multi-document) manifest."""
     with INTAKE_CRONJOB_PATH.open() as manifest:
-        return yaml.safe_load(manifest)
+        objects = list(yaml.safe_load_all(manifest))
+    return next(obj for obj in objects if obj["kind"] == "CronJob")
 
 
 def test_queue_manifest_encrypts_service_and_route():
