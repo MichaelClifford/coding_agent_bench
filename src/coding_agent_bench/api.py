@@ -87,6 +87,14 @@ def _worker_server_url_errors(
 
 db_path = Path(os.environ.get("JOB_STORE_PATH", "jobs.db"))
 
+class InstancePreempted(Exception):
+    """Raised when the Nebius instance backing a running job is lost mid-run.
+
+    The affected job is paused (checkpointed to MinIO) and auto-resumed once
+    Nebius is reachable again; it must never surface as user cancellation.
+    """
+
+
 class JobStatus(str, Enum):
     QUEUED = "queued"
     RUNNING = "running"
@@ -96,11 +104,33 @@ class JobStatus(str, Enum):
     FAILED = "failed"
     CANCELLING = "cancelling"
     CANCELLED = "cancelled"
+    PAUSING = "pausing"
+    PAUSED = "paused"
 
 
 NEBIUS_IDLE_TIMEOUT = int(os.environ.get("NEBIUS_IDLE_TIMEOUT_SECONDS", "600"))
 CLEANUP_MAX_ATTEMPTS = int(os.environ.get("CLEANUP_MAX_ATTEMPTS", "120"))
 CLEANUP_RETRY_INTERVAL_SECONDS = float(os.environ.get("CLEANUP_RETRY_INTERVAL_SECONDS", "5"))
+MAX_PREEMPT_RESUMES = int(os.environ.get("MAX_PREEMPT_RESUMES", "3"))
+PREEMPT_STABLE_SECONDS = int(os.environ.get("PREEMPT_STABLE_SECONDS", "90"))
+PREEMPT_RESTART_ATTEMPTS = int(os.environ.get("PREEMPT_RESTART_ATTEMPTS", "10"))
+PREEMPT_STABILIZE_ERROR_SECONDS = int(os.environ.get("PREEMPT_STABILIZE_ERROR_SECONDS", "120"))
+PAUSED_POLL_INTERVAL_SECONDS = int(os.environ.get("PAUSED_POLL_INTERVAL_SECONDS", "60"))
+PAUSE_UPLOAD_TIMEOUT_SECONDS = int(os.environ.get("PAUSE_UPLOAD_TIMEOUT_SECONDS", "600"))
+NEBIUS_UNREACHABLE_TRIGGER_SECONDS = int(os.environ.get("NEBIUS_UNREACHABLE_TRIGGER_SECONDS", "300"))
+NEBIUS_STOPPED_TRIGGER_SECONDS = int(os.environ.get("NEBIUS_STOPPED_TRIGGER_SECONDS", "45"))
+# States no start call can bring back (idle cleanup deletes preempted VMs
+# after NEBIUS_IDLE_TIMEOUT_SECONDS, leaving such records behind):
+NEBIUS_UNRECOVERABLE_STATES = {"DELETED", "ERROR", "CRASHED"}
+
+
+def _monotonic() -> float:
+    """Monotonic clock seam (patchable in tests)."""
+    return asyncio.get_running_loop().time()
+
+
+# Monitor iterations run every 5s; probe Nebius state every Nth iteration.
+DETECT_EVERY_N_POLLS = 3
 
 
 @dataclass
@@ -256,6 +286,141 @@ class NebiusOrchestrator:
                 await self._manager.delete_instance(instance_name)
             self._instances.pop(instance_name, None)
 
+    async def mark_job_paused(self, instance_name: str):
+        """Release a preempted instance: it is free again and its model died with it."""
+        state = self._instances.get(instance_name)
+        if state is None:
+            return
+        state.job_running = False
+        state.current_model = None
+        state.provisioning_model = None
+        state.last_job_completed_at = time.time()
+
+    async def adopt_paused_instance(self, model_name: str, gpu_config: str) -> str | None:
+        """Track the deterministic instance left by a paused job.
+
+        Returns the instance name when it exists in a startable state and
+        belongs to the paused job's gpu_config without another job on it.
+        Returns None when the instance is gone or sits in an unrecoverable
+        state (e.g. DELETED after idle cleanup deleted the preempted VM):
+        the caller then re-queues and the worker's acquire path deletes and
+        recreates it. Raises when the Nebius API is unreachable so the
+        caller keeps the job paused and retries on a later pass.
+        """
+        async with self._lock:
+            instance_name = self._pick_instance_name()
+            state = self._instances.get(instance_name)
+            if state is not None and (state.job_running or state.gpu_config != gpu_config):
+                return None
+            try:
+                remote = await self.get_instance_state(instance_name)
+            except Exception as e:
+                if "NotFound" in str(e):
+                    logger.info(
+                        f"Paused job's instance {instance_name} no longer exists; "
+                        "worker will recreate it"
+                    )
+                    self._instances.pop(instance_name, None)
+                    return None
+                raise
+            if remote in NEBIUS_UNRECOVERABLE_STATES:
+                logger.warning(
+                    f"Not adopting {instance_name} for paused recovery: state {remote} "
+                    "cannot be started; worker will delete and recreate it"
+                )
+                self._instances.pop(instance_name, None)
+                return None
+            if state is None:
+                self._instances[instance_name] = NebiusInstanceState(
+                    instance_name=instance_name,
+                    gpu_config=gpu_config,
+                    current_model=None,
+                    job_running=False,
+                    last_job_completed_at=time.time(),
+                )
+            return instance_name
+
+    async def recover_stopped_instance(self, instance_name: str) -> None:
+        """Start a preempted instance and prove it survives the stabilization window.
+
+        Raises RuntimeError after PREEMPT_RESTART_ATTEMPTS failed restarts so
+        the caller keeps the job paused and retries on a later pass.
+        """
+        for attempt in range(1, PREEMPT_RESTART_ATTEMPTS + 1):
+            try:
+                await self._manager.start_instance(instance_name)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(
+                    f"Preemption recovery: start of {instance_name} attempt "
+                    f"{attempt}/{PREEMPT_RESTART_ATTEMPTS} failed: {e}"
+                )
+                await asyncio.sleep(30)
+                continue
+            # start_instance just ensures RUNNING (it may have issued the
+            # start, found it already RUNNING, or waited out STARTING/
+            # CREATING). Which of those happened is not the point: only the
+            # stabilization window proves a preemptible machine will stay up,
+            # so always run it.
+            stable_since: float | None = None
+            error_since: float | None = None
+            while True:
+                await asyncio.sleep(10)
+                try:
+                    details = await self._manager.get_instance(instance_name)
+                    state = details.get("status", {}).get("state")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.exception(f"Preemption recovery: state check failed for {instance_name}")
+                    if "NotFound" in str(e):
+                        raise RuntimeError(
+                            f"Instance {instance_name} disappeared while stabilizing"
+                        ) from e
+                    if error_since is None:
+                        error_since = _monotonic()
+                    if _monotonic() - error_since >= PREEMPT_STABILIZE_ERROR_SECONDS:
+                        raise RuntimeError(
+                            f"Instance {instance_name} state checks failed for "
+                            f"{PREEMPT_STABILIZE_ERROR_SECONDS}s while stabilizing"
+                        ) from e
+                    stable_since = None
+                    continue
+                error_since = None
+                if state == "RUNNING":
+                    if stable_since is None:
+                        stable_since = _monotonic()
+                    if _monotonic() - stable_since >= PREEMPT_STABLE_SECONDS:
+                        logger.info(f"Preemption recovery: {instance_name} stable RUNNING for {PREEMPT_STABLE_SECONDS}s")
+                        return
+                elif state in ("STOPPED", "STOPPING"):
+                    logger.warning(
+                        f"Preemption recovery: {instance_name} preempted again while stabilizing "
+                        f"(attempt {attempt}/{PREEMPT_RESTART_ATTEMPTS})"
+                    )
+                    break
+                else:
+                    raise RuntimeError(f"Instance {instance_name} entered {state} while stabilizing")
+            await asyncio.sleep(30)
+        raise RuntimeError(
+            f"Instance {instance_name} was preempted {PREEMPT_RESTART_ATTEMPTS} times during recovery"
+        )
+
+    def has_busy_instance(self) -> bool:
+        """True when any tracked Nebius instance currently hosts a job."""
+        return any(state.job_running for state in self._instances.values())
+
+    async def get_instance_state(self, instance_name: str) -> str | None:
+        """Return the lifecycle state (RUNNING/STOPPED/...) of an instance.
+
+        Raises when the Nebius API call fails (an outage signal); returns
+        None when the payload lacks a usable state (a shape anomaly, which
+        is neither evidence of preemption nor of an outage).
+        """
+        details = await self._manager.get_instance(instance_name)
+        return details.get("status", {}).get("state")
+
     async def idle_cleanup_loop(self):
         """Periodically delete idle instances and evict stale entries."""
         while True:
@@ -371,7 +536,8 @@ class JobStore:
                 command TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'queued',
                 error TEXT,
-                idempotency_key TEXT
+                idempotency_key TEXT,
+                preempt_attempts INTEGER NOT NULL DEFAULT 0
             )"""
         )
         # Migrate columns when upgrading from an older schema.
@@ -380,6 +546,8 @@ class JobStore:
             conn.execute("ALTER TABLE jobs ADD COLUMN server_url TEXT NOT NULL DEFAULT ''")
         if "idempotency_key" not in columns:
             conn.execute("ALTER TABLE jobs ADD COLUMN idempotency_key TEXT")
+        if "preempt_attempts" not in columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN preempt_attempts INTEGER NOT NULL DEFAULT 0")
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotency_key "
             "ON jobs(idempotency_key) WHERE idempotency_key IS NOT NULL"
@@ -431,6 +599,29 @@ class JobStore:
         conn.commit()
         conn.close()
 
+    def update_status_if(
+        self,
+        job_id: str,
+        expected: JobStatus,
+        status: JobStatus,
+        error: str | None = None,
+    ) -> bool:
+        """Update status only while the job still has the expected status.
+
+        Guards race-prone transitions (pause, requeue) from overwriting a
+        concurrent terminal write such as a user cancellation.
+        """
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "UPDATE jobs SET status = ?, error = ? WHERE job_id = ? AND status = ?",
+                (status.value, error, job_id, expected.value),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
     def get(self, job_id: str) -> dict | None:
         """Get a job by id."""
         conn = self._connect()
@@ -462,17 +653,59 @@ class JobStore:
         """List non-terminal jobs in their original enqueue order."""
         conn = self._connect()
         rows = conn.execute(
-            "SELECT * FROM jobs WHERE status IN (?, ?, ?, ?, ?) ORDER BY rowid",
+            "SELECT * FROM jobs WHERE status IN (?, ?, ?, ?, ?, ?) ORDER BY rowid",
             (
                 JobStatus.QUEUED.value,
                 JobStatus.RUNNING.value,
                 JobStatus.COMPLETING.value,
                 JobStatus.FAILING.value,
                 JobStatus.CANCELLING.value,
+                JobStatus.PAUSING.value,
             ),
         ).fetchall()
         conn.close()
         return [dict(row) for row in rows]
+
+    def list_paused(self) -> "list[dict]":
+        """List preempted jobs parked and waiting for Nebius, in enqueue order."""
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE status = ? ORDER BY rowid",
+            (JobStatus.PAUSED.value,),
+        ).fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+    def pause_commit(
+        self,
+        job_id: str,
+        command: "list[str]",
+        attempts: int,
+        error: str,
+    ) -> bool:
+        """Atomically park a job as paused with its rebuilt resume command.
+
+        Only succeeds while the job is still in `pausing`, so a stale
+        finalize can never resurrect a job that was cancelled meanwhile.
+        """
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "UPDATE jobs SET command = ?, status = ?, preempt_attempts = ?, error = ? "
+                "WHERE job_id = ? AND status = ?",
+                (
+                    json.dumps(command),
+                    JobStatus.PAUSED.value,
+                    attempts,
+                    error,
+                    job_id,
+                    JobStatus.PAUSING.value,
+                ),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
 
 
 job_store = JobStore(db_path)
@@ -522,6 +755,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     has_recoverable_nebius = await _restore_jobs()
     if _nebius is not None and not has_recoverable_nebius:
         background_tasks.append(asyncio.create_task(_delete_recovered_nebius("startup")))
+    if _nebius is not None:
+        background_tasks.append(asyncio.create_task(_resume_paused_jobs_loop()))
     worker_task = asyncio.create_task(_worker())
     cleanup_task = asyncio.create_task(_build_pod_cleanup_loop())
     yield
@@ -586,6 +821,92 @@ async def _build_pod_cleanup_loop():
                     await _run_oc(["delete", "pods", *pods, "--ignore-not-found"])
         except Exception:
             logger.exception("Build pod cleanup failed")
+
+
+async def _resume_paused_jobs_loop():
+    """Park-and-wait engine for preempted jobs: restart the VM, then re-queue.
+
+    Waits for Nebius to be reachable again indefinitely; the resume budget
+    only counts actual mid-run preemptions. Flipping a row to queued defers
+    full re-provisioning (recreate if needed, vLLM start, new-IP rewrite) to
+    the worker's normal acquire path.
+    """
+    while True:
+        await asyncio.sleep(PAUSED_POLL_INTERVAL_SECONDS)
+        if _nebius is None or _shutting_down:
+            continue
+        if _active_job is not None:
+            continue  # never fight the serial queue for the shared instance
+        try:
+            rows = job_store.list_paused()
+        except Exception:
+            logger.exception("Paused job scan failed")
+            continue
+        for row in rows:
+            gpu = _parse_nebius_url(row["server_url"])
+            if gpu is None:
+                logger.warning(
+                    f"Paused job {row['job_id']} has no Nebius server URL; re-queuing for normal handling"
+                )
+                if job_store.update_status_if(
+                    row["job_id"], JobStatus.PAUSED, JobStatus.QUEUED, error=row["error"]
+                ):
+                    _job_queue.append(QueuedJob(
+                        row["job_id"],
+                        json.loads(row["command"]),
+                        row["server_url"],
+                        row["model_name"],
+                    ))
+                    _job_event.set()
+                continue
+            # Note: has_busy_instance()/recovery vs. a concurrent worker
+            # acquire on the same shared instance is a benign TOCTOU: the
+            # serial queue means the worst case is a redundant start call
+            # (idempotent when RUNNING) or one wasted model swap.
+            if _nebius.has_busy_instance():
+                continue
+            try:
+                instance_name = await _nebius.adopt_paused_instance(row["model_name"], gpu)
+                if instance_name is not None:
+                    if _active_job is not None:
+                        continue
+                    await _nebius.recover_stopped_instance(instance_name)
+                attempt_note = f" (attempt {int(row.get('preempt_attempts') or 0)}/{MAX_PREEMPT_RESUMES})" if MAX_PREEMPT_RESUMES else ""
+                outcome_note = (
+                    "VM recovered — resuming"
+                    if instance_name is not None
+                    else "instance unavailable — worker will recreate"
+                )
+                # Recovery may take minutes: a cancellation that landed in the
+                # meantime must win, so re-enter the queue only if still paused.
+                if not job_store.update_status_if(
+                    row["job_id"],
+                    JobStatus.PAUSED,
+                    JobStatus.QUEUED,
+                    error=f"{outcome_note}{attempt_note}",
+                ):
+                    logger.info(
+                        f"Paused job {row['job_id']} left the paused state during recovery; not re-queuing"
+                    )
+                    break
+                # Flipping the DB row is not dispatch: the original QueuedJob
+                # entry was popped before the job ever ran, so the row must be
+                # re-added to the in-memory queue for the worker to pick it up.
+                _job_queue.append(QueuedJob(
+                    row["job_id"],
+                    json.loads(row["command"]),
+                    row["server_url"],
+                    row["model_name"],
+                ))
+                _job_event.set()
+                logger.info(f"Re-queued paused job {row['job_id']}")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    f"Nebius still unavailable for paused job {row['job_id']}; retrying next pass"
+                )
+            break  # one paused job per pass: the shared VM makes serial order matter
 
 
 async def _best_effort_cleanup(oj: OpenshiftJob, signal: bool = False) -> str | None:
@@ -702,6 +1023,163 @@ async def _delete_recovered_nebius(job_id: str) -> None:
     logger.error(f"Nebius cleanup exhausted for {job_id}; advancing recovery")
 
 
+def _build_pause_resume_command(row: dict) -> list[str]:
+    """Build the in-row resume command that re-runs a preempted job from MinIO.
+
+    An explicit nebius placeholder as server_url makes the worker re-provision
+    the instance and inject the URL rewrite for the new IP at run time.
+    """
+    attempts = int(row.get("preempt_attempts") or 0)
+    original_name = (row["job_name"] or "").removesuffix("--resume")
+    server_url = row.get("server_url") or ""
+    staging_id = f"{row['job_id']}-p{attempts}"
+    shell_command = _build_resume_shell_command(
+        original_name,
+        staging_id,
+        [],
+        server_url if _parse_nebius_url(server_url) is None else None,
+    )
+    return ["bash", "-c", shell_command]
+
+
+async def _pause_commit(job_id: str, oj: OpenshiftJob) -> bool:
+    """Checkpoint a preempted job to MinIO and park it as paused.
+
+    SIGTERMs harbor (bounded) so the pod script can finish its MinIO upload,
+    deletes the OpenShift Job and task pods, then atomically rewrites the row
+    into its resume command. Idempotent: safe to re-run after a crash, and it
+    refuses to touch jobs that already left the pausing state.
+    """
+    row = job_store.get(job_id)
+    if not row or row["status"] != JobStatus.PAUSING.value:
+        return True
+
+    signal = False
+    existing = None
+    for attempt in range(1, CLEANUP_MAX_ATTEMPTS + 1):
+        try:
+            existing = await oj._get_job()
+            break
+        except Exception:
+            logger.exception(
+                f"Unable to inspect OpenShift Job for paused job {job_id} "
+                f"(attempt {attempt}/{CLEANUP_MAX_ATTEMPTS})"
+            )
+            if attempt == CLEANUP_MAX_ATTEMPTS:
+                return False
+            await asyncio.sleep(CLEANUP_RETRY_INTERVAL_SECONDS)
+
+    if existing is not None:
+        conditions = {
+            condition.get("type")
+            for condition in existing.get("status", {}).get("conditions", [])
+            if condition.get("status") == "True"
+        }
+        if not conditions.intersection({"Complete", "Failed"}):
+            signal = True
+
+    # Signal inline rather than via _best_effort_cleanup: the pod must be
+    # given the full upload budget before it is deleted, and cancel paths
+    # keep their original short 60s wait.
+    cleanup_errors: list[str] = []
+    checkpoint_note = ""
+    if signal:
+        try:
+            exited = await oj._signal_job_pod(wait_seconds=PAUSE_UPLOAD_TIMEOUT_SECONDS)
+        except Exception as e:
+            cleanup_errors.append(f"signal failed: {e}")
+            exited = False
+        if exited is False:
+            checkpoint_note = (
+                "; checkpoint upload may be incomplete (job pod outlived the pause budget)"
+            )
+            logger.error(
+                f"Job {job_id} pod did not exit within {PAUSE_UPLOAD_TIMEOUT_SECONDS}s; "
+                "deleting it may truncate the MinIO checkpoint"
+            )
+    try:
+        await oj._delete_job()
+    except Exception as e:
+        cleanup_errors.append(f"delete failed: {e}")
+    cleanup_err = "; ".join(cleanup_errors) if cleanup_errors else None
+    if cleanup_err:
+        job_store.update_status_if(
+            job_id,
+            JobStatus.PAUSING,
+            JobStatus.PAUSING,
+            error=f"pause cleanup failed: {cleanup_err}",
+        )
+        return False
+
+    attempts = int(row.get("preempt_attempts") or 0) + 1
+    attempt_note = f" (attempt {attempts}/{MAX_PREEMPT_RESUMES})" if MAX_PREEMPT_RESUMES else ""
+    parked = job_store.pause_commit(
+        job_id,
+        _build_pause_resume_command(row),
+        attempts,
+        f"VM preempted — awaiting Nebius recovery{attempt_note}{checkpoint_note}",
+    )
+    if not parked:
+        logger.info(f"Job {job_id} left the pausing state during finalize; skipping park")
+    return parked
+
+
+async def _retry_pause_finalize(job_id: str, oj: OpenshiftJob) -> None:
+    """Retry pause checkpointing without blocking the serial queue forever."""
+    for attempt in range(1, CLEANUP_MAX_ATTEMPTS + 1):
+        if await _pause_commit(job_id, oj):
+            return
+        logger.warning(
+            f"Pause finalize attempt {attempt}/{CLEANUP_MAX_ATTEMPTS} failed for {job_id}"
+        )
+        if attempt < CLEANUP_MAX_ATTEMPTS:
+            await asyncio.sleep(CLEANUP_RETRY_INTERVAL_SECONDS)
+
+    row = job_store.get(job_id)
+    logger.error(f"Pause finalize exhausted for {job_id}; parking anyway with error noted")
+    if row and row["status"] == JobStatus.PAUSING.value:
+        new_attempts = int(row.get("preempt_attempts") or 0) + 1
+        attempt_note = f" (attempt {new_attempts}/{MAX_PREEMPT_RESUMES})" if MAX_PREEMPT_RESUMES else ""
+        parked = job_store.pause_commit(
+            job_id,
+            _build_pause_resume_command(row),
+            new_attempts,
+            f"VM preempted — parked after cleanup failure; resume may need manual attention{attempt_note}",
+        )
+        if not parked:
+            logger.info(f"Job {job_id} left the pausing state during forced park; skipping")
+
+
+async def _handle_pause(job_id: str, oj: OpenshiftJob, nebius_instance_name: str | None) -> None:
+    """Pause a running job whose Nebius VM was lost, resuming it automatically later."""
+    row = job_store.get(job_id)
+    if not row:
+        return
+    attempts = int(row.get("preempt_attempts") or 0)
+    if attempts >= MAX_PREEMPT_RESUMES:
+        await _retry_terminal_job(
+            job_id,
+            oj,
+            JobStatus.FAILED,
+            error=f"VM preempted repeatedly; exhausted {MAX_PREEMPT_RESUMES} auto-resume attempts",
+        )
+        if nebius_instance_name and _nebius:
+            await _nebius.mark_job_completed(nebius_instance_name)
+        return
+
+    if not job_store.update_status_if(
+        job_id,
+        JobStatus.RUNNING,
+        JobStatus.PAUSING,
+        error=f"VM preempted — checkpointing results to MinIO (attempt {attempts + 1}/{MAX_PREEMPT_RESUMES})",
+    ):
+        logger.info(f"Job {job_id} left running before pause could start; skipping pause")
+        return
+    if nebius_instance_name and _nebius:
+        await _nebius.mark_job_paused(nebius_instance_name)
+    await _retry_pause_finalize(job_id, oj)
+
+
 async def _restore_jobs() -> bool:
     """Rebuild the dispatcher without making startup depend on OpenShift."""
     _job_event.clear()
@@ -719,6 +1197,13 @@ async def _restore_jobs() -> bool:
     if _job_queue:
         logger.info(f"Recovered {len(_job_queue)} non-terminal jobs")
         _job_event.set()
+    if not has_recoverable_nebius:
+        # A paused job intentionally owns the stopped VM until recovery. Do
+        # not let startup cleanup delete that VM and its warm model cache.
+        has_recoverable_nebius = any(
+            _parse_nebius_url(row["server_url"]) is not None
+            for row in job_store.list_paused()
+        )
     return has_recoverable_nebius
 
 async def _run_job(
@@ -728,6 +1213,7 @@ async def _run_job(
     managed_endpoint: bool = False,
     openrouter: bool = False,
     adopt_existing: bool = False,
+    nebius_instance_name: str | None = None,
 ):
     """Validate, run, and monitor an OpenShift Job."""
     if server_url:
@@ -783,6 +1269,20 @@ async def _run_job(
 
         consecutive_missing = 0
         max_missing = 6  # 6 polls × 5s = 30s before declaring pod gone
+        poll_count = 0
+        first_stopped_at: float | None = None
+        first_unreachable_at: float | None = None
+        last_error_note: str | None = None
+        stopped_threshold = (
+            float(NEBIUS_STOPPED_TRIGGER_SECONDS)
+            if nebius_instance_name and not _shutting_down
+            else float("inf")
+        )
+        error_threshold = (
+            float(NEBIUS_UNREACHABLE_TRIGGER_SECONDS)
+            if nebius_instance_name and not _shutting_down
+            else float("inf")
+        )
 
         while True:
             try:
@@ -819,12 +1319,71 @@ async def _run_job(
                 error = f"Failed: reason={reason}, message={message}"
                 await _retry_terminal_job(job_id, oj, JobStatus.FAILED, error=error)
                 return
+
+            # Nebius preemption detection: the queue's only view of the model
+            # endpoint's health. Harbor's own connection errors are invisible
+            # here, and an on-preemption-stopped instance keeps answering
+            # get-by-name with state STOPPED — no error fires. Sampled every
+            # DETECT_EVERY_N_POLLS monitor iterations; trigger thresholds are
+            # measured on the monotonic clock, not by counting samples.
+            poll_count += 1
+            if (
+                nebius_instance_name
+                and _nebius is not None
+                and not _shutting_down
+                and poll_count % DETECT_EVERY_N_POLLS == 0
+            ):
+                now = _monotonic()
+                try:
+                    state = await _nebius.get_instance_state(nebius_instance_name)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    last_error_note = str(e).splitlines()[0][:200] if str(e) else e.__class__.__name__
+                    first_stopped_at = None
+                    if first_unreachable_at is None:
+                        first_unreachable_at = now
+                    if now - first_unreachable_at >= error_threshold:
+                        raise InstancePreempted(
+                            f"Nebius API unreachable for {nebius_instance_name} "
+                            f"(last error: {last_error_note})"
+                        ) from e
+                else:
+                    if state in ("STOPPED", "STOPPING", "DELETED", "ERROR", "CRASHED"):
+                        first_unreachable_at = None
+                        last_error_note = None
+                        if first_stopped_at is None:
+                            first_stopped_at = now
+                        if now - first_stopped_at >= stopped_threshold:
+                            raise InstancePreempted(
+                                f"Nebius instance {nebius_instance_name} is {state}"
+                            )
+                    elif state is None:
+                        # A response without a usable state is an observation
+                        # failure, not evidence the VM stopped: the longer
+                        # unavailability threshold keeps a CLI/API payload
+                        # regression from mass-pausing healthy runs in 45s.
+                        first_stopped_at = None
+                        if first_unreachable_at is None:
+                            first_unreachable_at = now
+                        if now - first_unreachable_at >= error_threshold:
+                            raise InstancePreempted(
+                                f"Nebius instance {nebius_instance_name} reports no usable state"
+                            )
+                    else:
+                        last_error_note = None
+                        first_stopped_at = None
+                        first_unreachable_at = None
+
             await asyncio.sleep(5)
 
     except asyncio.CancelledError:
         if _shutting_down:
             raise
         await _finish_cancellation(job_id, oj, signal=True)
+        raise
+
+    except InstancePreempted:
         raise
 
     except Exception as e:
@@ -885,6 +1444,27 @@ async def _process_queued_job(queued: QueuedJob) -> None:
             if nebius_gpu_config is not None and _nebius:
                 await _delete_recovered_nebius(job_id)
             await _retry_cancellation(job_id, oj)
+            return
+
+        if row["status"] == JobStatus.PAUSING.value:
+            # A pause checkpoint was interrupted by a queue-service restart.
+            # Finalizing must keep the (stopped) Nebius VM — unlike the
+            # cancelling branch, this job intends to come back on it.
+            if nebius_gpu_config is not None and _nebius:
+                # Side effect only: tracking the stopped VM keeps a later
+                # acquire_instance from deleting it as untracked garbage and
+                # makes the recovery loop's adoption idempotent. Best-effort:
+                # adopt_paused_instance re-raises during API outages, and an
+                # uncaught exception here would kill the dispatcher — the
+                # recovery loop re-adopts once Nebius answers. The name is
+                # irrelevant for finalizing the pause either way.
+                try:
+                    await _nebius.adopt_paused_instance(model_name, nebius_gpu_config)
+                except Exception:
+                    logger.exception(
+                        f"Could not track Nebius instance while finalizing pause for {job_id}"
+                    )
+            await _retry_pause_finalize(job_id, oj)
             return
 
         if nebius_gpu_config is not None and not _nebius:
@@ -964,14 +1544,26 @@ async def _process_queued_job(queued: QueuedJob) -> None:
         if "--model-max-len" not in command and model_config is not None:
             command += ["--model-max-len", str(model_config.model_max_len)]
 
-        await _run_job(
-            job_id,
-            command,
-            server_url=None if adopt_existing else job_server_url,
-            managed_endpoint=managed_endpoint,
-            openrouter=is_openrouter(server_url),
-            adopt_existing=adopt_existing,
-        )
+        try:
+            await _run_job(
+                job_id,
+                command,
+                server_url=None if adopt_existing else job_server_url,
+                managed_endpoint=managed_endpoint,
+                openrouter=is_openrouter(server_url),
+                adopt_existing=adopt_existing,
+                nebius_instance_name=nebius_instance_name,
+            )
+        except InstancePreempted as e:
+            logger.error(
+                f"Nebius preemption detected for job {job_id}: {e}; "
+                "checkpointing results to MinIO and parking the job as paused"
+            )
+            await _handle_pause(job_id, oj, nebius_instance_name)
+            # A cancel may have raced the pause (which then skipped): finish it.
+            if job_store.get(job_id)["status"] == JobStatus.CANCELLING.value:
+                await _retry_cancellation(job_id, oj)
+            return
 
         if job_store.get(job_id)["status"] == JobStatus.CANCELLING.value:
             await _retry_cancellation(job_id, oj)
@@ -1004,6 +1596,7 @@ async def _worker():
                 JobStatus.COMPLETING.value,
                 JobStatus.FAILING.value,
                 JobStatus.CANCELLING.value,
+                JobStatus.PAUSING.value,
             )
             if not row or (adopt_existing and row["status"] not in recoverable_statuses):
                 continue
@@ -1019,6 +1612,13 @@ async def _worker():
                 oj = OpenshiftJob(job_name=job_id, clean_legacy_pods=adopt_existing)
                 if not await _finish_cancellation(job_id, oj, signal=False):
                     await _retry_cancellation(job_id, oj)
+            except Exception:
+                # Defensive backstop: worker_task is never restarted, so no
+                # per-job failure may escape and kill the dispatcher. The row
+                # keeps whatever status the crash left it in (never rewritten
+                # from here, to avoid clobbering a pause/cancel in flight);
+                # the queue moves on to the next job.
+                logger.exception(f"Queue handler crashed while processing {job_id}")
             finally:
                 if _active_job and _active_job[0] == job_id:
                     _active_job = None
@@ -1055,6 +1655,7 @@ async def ui():
         + job_store.list(JobStatus.FAILING)
         + job_store.list(JobStatus.CANCELLING)
     )
+    paused = job_store.list(JobStatus.PAUSING) + job_store.list(JobStatus.PAUSED)
     queued = job_store.list(JobStatus.QUEUED)
     completed = job_store.list(JobStatus.COMPLETED) + job_store.list(JobStatus.FAILED) + job_store.list(JobStatus.CANCELLED)
     completed.reverse()
@@ -1153,6 +1754,7 @@ h1 svg {{ flex-shrink: 0; }}
 {submit_form_html}
 {nebius_section}
 {build_table("Running", running)}
+{build_table("Paused (awaiting Nebius recovery)", paused)}
 {build_table("Queued", queued)}
 {build_table("Completed", completed)}
 </body>
@@ -1352,8 +1954,23 @@ async def delete_job(job_id: str):
         JobStatus.FAILING,
         JobStatus.FAILED,
         JobStatus.CANCELLED,
+        JobStatus.PAUSING,
     ):
         raise HTTPException(status_code=400, detail=f"Job already {job_row['status']}")
+
+    # A paused job has no live workloads; cancelling it just retires the row.
+    # The shared Nebius instance must NOT be released here: it belongs to the
+    # pool, and idle cleanup handles it.
+    if job_row["status"] == JobStatus.PAUSED.value:
+        # CAS: the resume loop may have re-queued the job since the read;
+        # never clobber a live status with an unconditional write. If the
+        # race was lost, fall through to the normal cancel path with a
+        # refreshed row.
+        if job_store.update_status_if(job_id, JobStatus.PAUSED, JobStatus.CANCELLED):
+            return {"message": "Job cancelled", "job_id": job_id}
+        job_row = job_store.get(job_id)
+        if not job_row:
+            raise HTTPException(status_code=404, detail="Job not found")
 
     # Remove from the queue only when the persisted job has never started.
     for i, queued in enumerate(_job_queue):
@@ -1445,49 +2062,31 @@ def _build_parent_env_shell_step(py_job_dir: str) -> str:
     return f" && python3 -c {shlex.quote(chr(10).join(lines))}"
 
 
-@router.post("/jobs/{job_id}/resume")
-async def resume_job(job_id: str, req: ResumeJobRequest = ResumeJobRequest()):
-    """Resume a completed/failed job by retrying errored tasks via harbor jobs resume."""
-    job_row = job_store.get(job_id)
-    if not job_row:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if job_row["status"] not in (JobStatus.COMPLETED.value, JobStatus.FAILED.value):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Can only resume completed/failed jobs, got {job_row['status']}",
-        )
+def _build_resume_shell_command(
+    original_job_name: str,
+    staging_id: str,
+    filter_error_types: list[str],
+    server_url: str | None,
+) -> str:
+    """Build the bash -c payload that restores a job from MinIO and resumes it.
 
-    original_job_name = job_row["job_name"]
-    resume_job_id = str(uuid.uuid4())
-    resume_job_name = f"{original_job_name}--resume"
-
-    original_server_url = job_row.get("server_url", "")
-    effective_server_url = req.server_url or original_server_url
-
-    # Validate nebius URLs the same way create_job does
-    nebius_gpu_config = _parse_nebius_url(effective_server_url)
-    if nebius_gpu_config is not None:
-        if not _nebius:
-            raise HTTPException(status_code=400, detail="Nebius is not enabled on this server")
-        if nebius_gpu_config not in RESOURCE_CONFIG_REGISTRY:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unknown resource config '{nebius_gpu_config}'. Choose from: {', '.join(RESOURCE_CONFIG_REGISTRY)}",
-            )
-
+    Shared by the manual resume endpoint and preemption auto-resume. The
+    worker injects the Nebius URL-rewrite step at run time for placeholder
+    server URLs, so this builder only embeds a rewrite for explicit URLs.
+    """
     job_dir = f"/app/jobs/{shlex.quote(original_job_name)}"
     py_job_dir = f"/app/jobs/{original_job_name}"
     aws = "uv run --no-sync --no-cache aws --endpoint-url http://harbor-minio:9000"
     results_uri = shlex.quote(f"s3://results/{original_job_name}/")
     # A separate bucket keeps recovery snapshots out of results consumers' listings.
-    staging_root = f"s3://results-staging/{original_job_name}/{resume_job_id}"
+    staging_root = f"s3://results-staging/{original_job_name}/{staging_id}"
     original_uri = shlex.quote(f"{staging_root}/original/")
     updated_uri = shlex.quote(f"{staging_root}/updated/")
     resume_command = [
         "uv", "run", "--no-sync", "--no-cache", "harbor", "jobs", "resume",
         "-p", py_job_dir,
     ]
-    for error_type in req.filter_error_types:
+    for error_type in filter_error_types:
         resume_command += ["-f", error_type]
 
     # URL replacement only applies to real, changing hostnames (e.g. a new
@@ -1495,10 +2094,10 @@ async def resume_job(job_id: str, req: ResumeJobRequest = ResumeJobRequest()):
     # the worker) and for the openrouter sentinel, whose URL is static and
     # already baked into the restored config.
     url_replace_step = ""
-    if req.server_url and nebius_gpu_config is None and not is_openrouter(req.server_url):
-        url_replace_step = _build_url_replace_shell_step(req.server_url, py_job_dir)
+    if server_url and _parse_nebius_url(server_url) is None and not is_openrouter(server_url):
+        url_replace_step = _build_url_replace_shell_step(server_url, py_job_dir)
 
-    shell_command = (
+    return (
         "export AWS_ACCESS_KEY_ID=\"$MINIO_ROOT_USER\" "
         "AWS_SECRET_ACCESS_KEY=\"$MINIO_ROOT_PASSWORD\" "
         "AWS_DEFAULT_REGION=us-east-1 AWS_EC2_METADATA_DISABLED=true"
@@ -1519,6 +2118,48 @@ async def resume_job(job_id: str, req: ResumeJobRequest = ResumeJobRequest()):
         f" && {aws} s3 sync --delete {updated_uri} {results_uri}"
         # Keep both snapshots for recovery if promotion partially fails or is interrupted.
         " || exit $?; exit \"$harbor_rc\""
+    )
+
+
+@router.post("/jobs/{job_id}/resume")
+async def resume_job(job_id: str, req: ResumeJobRequest = ResumeJobRequest()):
+    """Resume a finished/cancelled job by retrying errored tasks via harbor jobs resume."""
+    job_row = job_store.get(job_id)
+    if not job_row:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job_row["status"] not in (
+        JobStatus.COMPLETED.value,
+        JobStatus.FAILED.value,
+        JobStatus.CANCELLED.value,
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Can only resume completed/failed/cancelled jobs, got {job_row['status']}",
+        )
+
+    original_job_name = job_row["job_name"]
+    resume_job_id = str(uuid.uuid4())
+    resume_job_name = f"{original_job_name}--resume"
+
+    original_server_url = job_row.get("server_url", "")
+    effective_server_url = req.server_url or original_server_url
+
+    # Validate nebius URLs the same way create_job does
+    nebius_gpu_config = _parse_nebius_url(effective_server_url)
+    if nebius_gpu_config is not None:
+        if not _nebius:
+            raise HTTPException(status_code=400, detail="Nebius is not enabled on this server")
+        if nebius_gpu_config not in RESOURCE_CONFIG_REGISTRY:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown resource config '{nebius_gpu_config}'. Choose from: {', '.join(RESOURCE_CONFIG_REGISTRY)}",
+            )
+
+    shell_command = _build_resume_shell_command(
+        original_job_name,
+        resume_job_id,
+        req.filter_error_types,
+        req.server_url,
     )
 
     command = ["bash", "-c", shell_command]

@@ -2,7 +2,12 @@ import shlex
 import shutil
 import subprocess
 import asyncio
+import logging
+
 import json
+
+
+logger = logging.getLogger(__name__)
 
 
 def _build_logged_shell_step(command: list[str], job_dir: str) -> str:
@@ -232,10 +237,18 @@ class OpenshiftJob:
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"oc returned invalid JSON for job/{self._pod_name}") from exc
 
-    async def _signal_job_pod(self) -> None:
+    async def _signal_job_pod(self, wait_seconds: int = 60) -> bool | None:
         """Send SIGTERM to the harbor process inside the job pod so it
         can run its own cleanup (stopping task pods via
-        OpenshiftEnvironment.stop)."""
+        OpenshiftEnvironment.stop).
+
+        Waits up to wait_seconds for the pod to exit; the pod's script
+        uploads results to MinIO after harbor returns, so pausing passes a
+        budget large enough to cover that upload before the job is deleted.
+        Returns True if the pod reached a terminal phase within the budget,
+        False if it was still running when the wait expired (the checkpoint
+        upload may then be incomplete), or None if no job pod existed.
+        """
         stdout, _ = await self._run_oc_command(
             [
                 "get", "pod",
@@ -262,7 +275,7 @@ class OpenshiftJob:
             check=False,
         )
 
-        for _ in range(30):
+        for _ in range(max(1, wait_seconds // 2)):
             result_stdout, _ = await self._run_oc_command(
                 [
                     "get", "pod", pod_name,
@@ -272,8 +285,13 @@ class OpenshiftJob:
             )
             phase = (result_stdout or "").strip()
             if phase in ("Succeeded", "Failed", ""):
-                break
+                return True
             await asyncio.sleep(2)
+
+        logger.warning(
+            f"Job pod {pod_name} still {phase or 'running'} after {wait_seconds}s wait"
+        )
+        return False
 
     async def _delete_harbor_pods(self):
         """Delete task pods whose environment identifies this parent Job."""
