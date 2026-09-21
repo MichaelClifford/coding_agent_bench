@@ -298,8 +298,8 @@ def _build_advanced_fields_html(nebius_configs: list[str], nebius_enabled: bool)
             <label for="skills" style="display: block; font-weight: bold; margin-bottom: 0.25rem;">Skills</label>
             <textarea id="skills" name="skills" rows="2"
                       style="width: 100%; padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; font-family: monospace;"
-                      placeholder="Comma-separated paths or Git sources, e.g. ./skills/review, org/repo@main"></textarea>
-            <small style="color: #666;">Provide paths in task containers or Git sources separated by commas.</small>
+                      placeholder="Comma-separated Git sources, e.g. org/repo@main"></textarea>
+            <small style="color: #666;">Provide Git sources separated by commas.</small>
         </div>
         <div style="grid-column: 1 / -1;">
             <label for="before_script" style="display: block; font-weight: bold; margin-bottom: 0.25rem;">Before Script</label>
