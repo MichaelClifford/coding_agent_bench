@@ -2,6 +2,7 @@ from unittest.mock import MagicMock, patch
 
 from coding_agent_bench.intake.config import Column, Status
 from coding_agent_bench.intake.poller import (
+    _queue_verify,
     _row_idempotency_key,
     _validate_queue_url,
     process_rows,
@@ -283,6 +284,44 @@ def test_failed_row_with_pending_notification_is_retried(mock_httpx, mock_email)
     mock_httpx.get.assert_called_once()
     mock_email.assert_called_once()
     sheets.update_cell.assert_called_once_with(1, Column.NOTIFIED_DONE, "TRUE")
+
+
+def test_queue_verify_defaults_to_public_trust_store(monkeypatch):
+    """Fall back to the default trust store when no CA bundle is configured."""
+    monkeypatch.delenv("JOB_QUEUE_CA_BUNDLE", raising=False)
+    assert _queue_verify() is True
+
+
+def test_queue_verify_uses_configured_ca_bundle(monkeypatch):
+    """Use the configured CA bundle path when set (e.g. the service-serving CA)."""
+    monkeypatch.setenv("JOB_QUEUE_CA_BUNDLE", "/etc/ssl/service-ca/service-ca.crt")
+    assert _queue_verify() == "/etc/ssl/service-ca/service-ca.crt"
+
+
+def test_approved_row_submit_verifies_queue_tls(monkeypatch):
+    """Pass the configured CA bundle to the queue POST so TLS stays verified."""
+    monkeypatch.setenv("JOB_QUEUE_CA_BUNDLE", "/etc/ssl/service-ca/service-ca.crt")
+
+    with patch("coding_agent_bench.intake.poller.send_queued_email"), patch(
+        "coding_agent_bench.intake.poller.httpx"
+    ) as mock_httpx:
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"job_id": "uuid-tls"}
+        mock_httpx.post.return_value = mock_response
+
+        sheets = MagicMock()
+        sheets.get_all_rows.return_value = [_make_row(STATUS=Status.APPROVED.value)]
+
+        process_rows(
+            sheets=sheets,
+            api_base_url="https://job-queue-service.coding-agent-leaderboard.svc",
+            api_key="test-key",
+            sender_email="bench@example.com",
+        )
+
+        assert mock_httpx.post.call_args.kwargs["verify"] == (
+            "/etc/ssl/service-ca/service-ca.crt"
+        )
 
 
 def test_queue_url_requires_https(monkeypatch):

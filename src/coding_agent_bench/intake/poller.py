@@ -30,6 +30,17 @@ def _auto_approve_enabled() -> bool:
     return AUTO_APPROVE or os.environ.get("AUTO_APPROVE", "false").lower() == "true"
 
 
+def _queue_verify() -> str | bool:
+    """Return the CA bundle for verifying the queue's TLS certificate.
+
+    When the queue is reached over its in-cluster service address it presents
+    an OpenShift service-serving certificate, whose CA is not in the public
+    trust store. JOB_QUEUE_CA_BUNDLE points at that CA so verification stays
+    on; absent it, fall back to the default public trust store.
+    """
+    return os.environ.get("JOB_QUEUE_CA_BUNDLE") or True
+
+
 def _row_idempotency_key(row: list[str]) -> str:
     """Return a stable key for one form submission, independent of sheet row number."""
     identity_columns = (
@@ -73,6 +84,7 @@ def _submit_job(
         json=payload,
         headers={"X-API-Key": api_key},
         timeout=30,
+        verify=_queue_verify(),
     )
     response.raise_for_status()
     return response.json()
@@ -84,6 +96,7 @@ def _check_job_status(api_base_url: str, api_key: str, job_id: str) -> dict:
         f"{api_base_url.rstrip('/')}/jobs/{job_id}",
         headers={"X-API-Key": api_key},
         timeout=30,
+        verify=_queue_verify(),
     )
     response.raise_for_status()
     return response.json()
