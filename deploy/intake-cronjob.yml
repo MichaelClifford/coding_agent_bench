@@ -35,7 +35,7 @@ spec:
           restartPolicy: Never
           containers:
           - name: poller
-            image: ghcr.io/redhat-et/coding_agent_bench:v0.2.5
+            image: ghcr.io/redhat-et/coding_agent_bench:v0.2.6
             imagePullPolicy: Always
             # Run the venv's Python directly. `uv run` re-syncs the project into
             # /app/.venv and writes a cache under $HOME at startup, both of which
