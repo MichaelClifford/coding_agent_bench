@@ -24,6 +24,7 @@ from coding_agent_bench.agents import AGENT_REGISTRY
 from coding_agent_bench.ui import build_submit_form_html
 from coding_agent_bench import VERSION
 from coding_agent_bench.preemption import CANCELLED_ERROR_TYPE, PAUSE_PLUGIN
+from coding_agent_bench.resume import is_resume_command, resume_options, results_job_name
 
 import getpass
 import json
@@ -517,6 +518,7 @@ class JobResponse(BaseModel):
     status: JobStatus
     error: str | None = None
     idempotency_key: str | None = None
+    results_job_name: str | None = None
 
 
 class JobStore:
@@ -548,7 +550,8 @@ class JobStore:
                 error TEXT,
                 idempotency_key TEXT,
                 preempt_attempts INTEGER NOT NULL DEFAULT 0,
-                pause_checkpointed INTEGER NOT NULL DEFAULT 0
+                pause_checkpointed INTEGER NOT NULL DEFAULT 0,
+                results_job_name TEXT
             )"""
         )
         # Migrate columns when upgrading from an older schema.
@@ -561,6 +564,17 @@ class JobStore:
             conn.execute("ALTER TABLE jobs ADD COLUMN preempt_attempts INTEGER NOT NULL DEFAULT 0")
         if "pause_checkpointed" not in columns:
             conn.execute("ALTER TABLE jobs ADD COLUMN pause_checkpointed INTEGER NOT NULL DEFAULT 0")
+        if "results_job_name" not in columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN results_job_name TEXT")
+        # Legacy resume commands retain the real artifact path even when their
+        # display names have acquired one or more --resume suffixes.
+        for row in conn.execute(
+            "SELECT job_id, job_name, command FROM jobs WHERE results_job_name IS NULL"
+        ).fetchall():
+            conn.execute(
+                "UPDATE jobs SET results_job_name = ? WHERE job_id = ?",
+                (results_job_name(dict(row)), row["job_id"]),
+            )
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotency_key "
             "ON jobs(idempotency_key) WHERE idempotency_key IS NOT NULL"
@@ -578,14 +592,15 @@ class JobStore:
         server_url: str,
         command: list[str],
         idempotency_key: str | None = None,
+        results_job_name: str | None = None,
     ):
         """Add a new job to the tracking table."""
         conn = self._connect()
         try:
             conn.execute(
                 "INSERT INTO jobs "
-                "(job_id, job_name, agent, dataset, model_name, server_url, command, status, idempotency_key) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "(job_id, job_name, agent, dataset, model_name, server_url, command, status, idempotency_key, results_job_name) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     job_id,
                     job_name,
@@ -596,6 +611,7 @@ class JobStore:
                     json.dumps(command),
                     JobStatus.QUEUED.value,
                     idempotency_key,
+                    results_job_name or job_name,
                 ),
             )
             conn.commit()
@@ -631,6 +647,25 @@ class JobStore:
             cur = conn.execute(
                 "UPDATE jobs SET status = ?, error = ? WHERE job_id = ? AND status = ?",
                 (status.value, error, job_id, expected.value),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    def resume_paused(
+        self, job_id: str, command: list[str], server_url: str, artifact_name: str,
+    ) -> bool:
+        """Claim an existing paused row atomically against automatic recovery."""
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "UPDATE jobs SET status = ?, command = ?, server_url = ?, "
+                "results_job_name = ?, error = ? WHERE job_id = ? AND status = ?",
+                (
+                    JobStatus.QUEUED.value, json.dumps(command), server_url,
+                    artifact_name, "Manual resume requested", job_id, JobStatus.PAUSED.value,
+                ),
             )
             conn.commit()
             return cur.rowcount > 0
@@ -1068,7 +1103,7 @@ def _build_pause_resume_command(row: dict) -> list[str]:
     the instance and inject the URL rewrite for the new IP at run time.
     """
     attempts = int(row.get("preempt_attempts") or 0)
-    original_name = (row["job_name"] or "").removesuffix("--resume")
+    original_name = results_job_name(row)
     server_url = row.get("server_url") or ""
     staging_id = f"{row['job_id']}-p{attempts}"
     shell_command = _build_resume_shell_command(
@@ -1254,7 +1289,7 @@ async def _run_job(
 
     try:
         if not adopt_existing:
-            is_resume = len(command) == 3 and command[0] in ("sh", "bash") and command[1] == "-c"
+            is_resume = is_resume_command(command)
             if is_resume:
                 job_spec = oj._resume_job_spec(command[2])
             else:
@@ -1541,16 +1576,26 @@ async def _process_queued_job(queued: QueuedJob) -> None:
         elif nebius_gpu_config is not None and _nebius:
             try:
                 nebius_instance_name, real_url = await _nebius.acquire_instance(model_name, gpu_config=nebius_gpu_config)
-                is_resume = len(command) == 3 and command[0] in ("sh", "bash") and command[1] == "-c"
+                is_resume = is_resume_command(command)
                 if is_resume:
-                    job_name = row["job_name"]
-                    orig_name = job_name.removesuffix("--resume")
+                    orig_name = results_job_name(row)
                     py_job_dir = f"/app/jobs/{orig_name}"
                     step = _build_url_replace_shell_step(real_url, py_job_dir)
                     command = list(command)
                     # AWS also uses uv run: update URLs only after restoring the config.
                     parent_step = _build_parent_env_shell_step(py_job_dir)
-                    command[2] = command[2].replace(parent_step, parent_step + step, 1)
+                    if parent_step in command[2]:
+                        command[2] = command[2].replace(parent_step, parent_step + step, 1)
+                    else:
+                        # Queued/paused commands from an older image embed the old
+                        # preparation script. Rebuild them rather than silently
+                        # skipping the new VM address after an upgrade.
+                        options = resume_options(command)
+                        if not options:
+                            raise ValueError("Unrecognized saved Harbor resume command")
+                        command = ["bash", "-c", _build_resume_shell_command(
+                            orig_name, str(uuid.uuid4()), options["filters"], real_url,
+                        )]
                 else:
                     command = [real_url if arg == server_url else arg for arg in command]
                 job_server_url = real_url
@@ -1562,7 +1607,7 @@ async def _process_queued_job(queued: QueuedJob) -> None:
                 job_store.update_status(job_id, JobStatus.FAILED, error=f"Nebius provisioning failed: {e}")
                 return
 
-        if "--model-max-len" not in command and model_config is not None:
+        if not is_resume_command(command) and "--model-max-len" not in command and model_config is not None:
             command += ["--model-max-len", str(model_config.model_max_len)]
 
         try:
@@ -2020,67 +2065,19 @@ async def delete_job(job_id: str):
     return {"message": "Job cancelled", "job_id": job_id}
 
 def _build_url_replace_shell_step(server_url: str, py_job_dir: str) -> str:
-    """Build shell step that replaces model server URLs in downloaded job files."""
-    new_host = urlparse(server_url.rstrip("/")).netloc
-    new_domain = ".".join(new_host.rsplit(".", 2)[-2:])
-    replace_lines = [
-        "import os, json, re",
-        f"job_dir = {json.dumps(py_job_dir)}",
-        f"new_host = {json.dumps(new_host)}",
-        f"new_domain = {json.dumps(new_domain)}",
-        "config_path = os.path.join(job_dir, 'config.json')",
-        "if not os.path.exists(config_path): exit(0)",
-        "with open(config_path) as f: c = json.load(f)",
-        "envs = c.get('agents', [{}])[0].get('env', {})",
-        "hosts = set()",
-        "for v in envs.values():",
-        "    if not isinstance(v, str): continue",
-        "    for m in re.finditer('https?://([^\"\\\\s,}/]+)', v):",
-        "        hosts.add(m.group(1).split('/')[0])",
-        "hosts = [h for h in hosts if h != new_host and h.endswith(new_domain)]",
-        "replaced = 0",
-        "if hosts:",
-        "    for root, dirs, files in os.walk(job_dir):",
-        "        for file in files:",
-        "            if not file.endswith('.json'): continue",
-        "            path = os.path.join(root, file)",
-        "            with open(path, 'r') as f: content = f.read()",
-        "            orig = content",
-        "            for h in hosts: content = content.replace(h, new_host)",
-        "            if content != orig:",
-        "                with open(path, 'w') as f: f.write(content)",
-        "                replaced += 1",
-        "print(f'Replaced URL in {replaced} files')",
-        "# Regenerate Pi/Codex mount files with new URL",
-        f"server_url = {json.dumps(server_url)}",
-        "agent = c.get('agents', [{}])[0]",
-        "model_name = agent.get('model_name', '')",
-        "mounts = c.get('environment', {}).get('mounts', [])",
-        "for m in mounts:",
-        "    src, tgt = m.get('source',''), m.get('target','')",
-        "    if agent.get('name') == 'pi' and 'models.json' in tgt:",
-        "        json.dump({'providers': {'vllm': {'baseUrl': server_url, 'api': 'openai-completions', 'apiKey': 'NONE', 'models': [{'id': model_name, 'name': model_name}]}}}, open(src, 'w'))",
-        "        print('Regenerated Pi models.json')",
-        "    if agent.get('name') == 'codex' and 'config.toml' in tgt:",
-        "        open(src, 'w').write(f'[api]\\nbase_url = \"{server_url}\"\\napi_key = \"sk-no-key\"\\n[model]\\nmodel_id = \"{model_name}\"\\n')",
-        "        print('Regenerated Codex config.toml')",
-    ]
-    replace_script = "\n".join(replace_lines)
-    return f" && python3 -c {shlex.quote(replace_script)}"
+    """Retarget model settings consistently, including changed IPs and schemes."""
+    return " && " + shlex.join([
+        "uv", "run", "--no-sync", "--no-cache", "python", "-m",
+        "coding_agent_bench.resume", "endpoint", py_job_dir, server_url,
+    ])
 
 
 def _build_parent_env_shell_step(py_job_dir: str) -> str:
-    """Update a resumed Harbor config so new task pods retain parent ownership."""
-    lines = [
-        "import json, os",
-        f"path = {json.dumps(f'{py_job_dir}/config.json')}",
-        "with open(path) as f: config = json.load(f)",
-        "kwargs = config.setdefault('environment', {}).setdefault('kwargs', {})",
-        "env = kwargs.setdefault('persistent_env', {})",
-        "env['HARBOR_PARENT'] = os.environ['HARBOR_PARENT']",
-        "with open(path, 'w') as f: json.dump(config, f)",
-    ]
-    return f" && python3 -c {shlex.quote(chr(10).join(lines))}"
+    """Update parent ownership in the root config, saved trials, and locks."""
+    return " && " + shlex.join([
+        "uv", "run", "--no-sync", "--no-cache", "python", "-m",
+        "coding_agent_bench.resume", "parent", py_job_dir,
+    ])
 
 
 def _build_resume_shell_command(
@@ -2145,7 +2142,7 @@ def _build_resume_shell_command(
 
 @router.post("/jobs/{job_id}/resume")
 async def resume_job(job_id: str, req: ResumeJobRequest = ResumeJobRequest()):
-    """Resume a finished/cancelled job by retrying errored tasks via harbor jobs resume."""
+    """Resume a finished or paused job, preserving its original artifact location."""
     job_row = job_store.get(job_id)
     if not job_row:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -2153,13 +2150,14 @@ async def resume_job(job_id: str, req: ResumeJobRequest = ResumeJobRequest()):
         JobStatus.COMPLETED.value,
         JobStatus.FAILED.value,
         JobStatus.CANCELLED.value,
+        JobStatus.PAUSED.value,
     ):
         raise HTTPException(
             status_code=400,
-            detail=f"Can only resume completed/failed/cancelled jobs, got {job_row['status']}",
+            detail=f"Can only resume completed/failed/cancelled/paused jobs, got {job_row['status']}",
         )
 
-    original_job_name = job_row["job_name"]
+    original_job_name = results_job_name(job_row)
     resume_job_id = str(uuid.uuid4())
     resume_job_name = f"{original_job_name}--resume"
 
@@ -2180,14 +2178,23 @@ async def resume_job(job_id: str, req: ResumeJobRequest = ResumeJobRequest()):
     shell_command = _build_resume_shell_command(
         original_job_name,
         resume_job_id,
-        req.filter_error_types,
-        req.server_url,
+        req.filter_error_types or [CANCELLED_ERROR_TYPE],
+        effective_server_url,
     )
 
     command = ["bash", "-c", shell_command]
+    if job_row["status"] == JobStatus.PAUSED.value:
+        # Reuse the row, as automatic recovery does. Creating a child and leaving
+        # the original paused would allow the background loop to run both.
+        if not job_store.resume_paused(job_id, command, effective_server_url, original_job_name):
+            raise HTTPException(status_code=409, detail="Job left the paused state; refresh before retrying")
+        _job_queue.append(QueuedJob(job_id, command, effective_server_url, job_row["model_name"]))
+        _job_event.set()
+        return {"message": "Paused job queued for resume", "job_id": job_id, "job_name": job_row["job_name"]}
     job_store.insert(
         resume_job_id, resume_job_name, job_row["agent"],
         job_row["dataset"], job_row["model_name"], effective_server_url, command,
+        results_job_name=original_job_name,
     )
     _job_queue.append(QueuedJob(resume_job_id, command, effective_server_url, job_row["model_name"]))
     _job_event.set()

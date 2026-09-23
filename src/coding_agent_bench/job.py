@@ -3,10 +3,19 @@ import shutil
 import subprocess
 import asyncio
 import logging
+import os
 
 import json
 
 from coding_agent_bench.preemption import PAUSE_REQUEST_PATH
+
+
+DEFAULT_CODING_AGENT_BENCH_IMAGE = "ghcr.io/redhat-et/coding_agent_bench:latest"
+
+
+def _job_image() -> str:
+    """Allow isolated deployments to run the queue's matching image."""
+    return os.environ.get("CODING_AGENT_BENCH_IMAGE", DEFAULT_CODING_AGENT_BENCH_IMAGE)
 
 
 logger = logging.getLogger(__name__)
@@ -68,7 +77,7 @@ class OpenshiftJob:
                         "containers": [
                             {
                                 "name": "harbor",
-                                "image": "ghcr.io/redhat-et/coding_agent_bench:latest",
+                                "image": _job_image(),
                                 "imagePullPolicy": "Always",
                                 "command": ["bash", "-c"],
                                 "args": [shell_command],
@@ -139,7 +148,7 @@ class OpenshiftJob:
                         "containers": [
                             {
                                 "name": "harbor",
-                                "image": "ghcr.io/redhat-et/coding_agent_bench:latest",
+                                "image": _job_image(),
                                 "imagePullPolicy": "Always",
                                 "command": ["bash", "-c"],
                                 "args": [

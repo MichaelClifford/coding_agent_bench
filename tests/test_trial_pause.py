@@ -31,14 +31,16 @@ def harbor_job(tmp_path, monkeypatch):
         tasks.append(TaskConfig(path=directory))
     config = JobConfig(
         job_name="benchmark", jobs_dir=tmp_path / "jobs", tasks=tasks,
-        agents=[AgentConfig(name="oracle")], environment=EnvironmentConfig(type="docker"),
+        agents=[AgentConfig(name="oracle", env={"OPENAI_BASE_URL": "http://198.51.100.10:8000/v1"})],
+        environment=EnvironmentConfig(type="docker", kwargs={"persistent_env": {"HARBOR_PARENT": "old-parent"}}),
         n_concurrent_trials=1, quiet=True,
         retry=RetryConfig(max_retries=5, min_wait_sec=0.01, max_wait_sec=0.01),
     )
     return asyncio.run(Job.create(config))
 
 
-def test_pending_trials_cancel_without_starting_and_native_resume_selects_them(harbor_job, tmp_path, monkeypatch):
+@pytest.mark.parametrize("prepare_metadata", [False, True])
+def test_pending_trials_cancel_without_starting_and_native_resume_selects_them(harbor_job, tmp_path, monkeypatch, prepare_metadata):
     """Pending cancellations create result files, not trial environments or pods."""
     from harbor.cli import jobs as harbor_jobs
     from harbor.environments.factory import EnvironmentFactory
@@ -62,7 +64,9 @@ def test_pending_trials_cancel_without_starting_and_native_resume_selects_them(h
             self.callbacks = {event: [] for event in TrialEvent}
             self.name = config.task.path.name
             lock_index = next(i for i, c in enumerate(harbor_job._trial_configs) if c.task == config.task)
-            self.lock = harbor_job._job_lock.trials[lock_index]
+            self.lock = harbor_job._job_lock.trials[lock_index].model_copy(
+                update={"environment": config.environment, "agent": config.agent}
+            )
             self.result = TrialResult(
                 task_name=self.name, trial_name=config.trial_name,
                 trial_uri=self.paths.trial_dir.resolve().as_uri(),
@@ -132,16 +136,41 @@ def test_pending_trials_cancel_without_starting_and_native_resume_selects_them(h
     finished = next(r for r in result.trial_results if r.task_name == "done")
     completed_bytes = (harbor_job.job_dir / finished.trial_name / "result.json").read_bytes()
 
-    request.unlink()
+    if prepare_metadata:
+        from coding_agent_bench.resume import update_endpoint, update_parent
+
+        update_parent(harbor_job.job_dir, "new-parent")
+        update_endpoint(harbor_job.job_dir, "http://203.0.113.20:9000")
+
     allow_completion = True
     created.clear()
     monkeypatch.setattr(EnvironmentFactory, "run_preflight", lambda **_kwargs: None)
+    if prepare_metadata:
+        # Preempt again before the resumed trials start: the successful original
+        # trial must survive another cancellation/filter/metadata-rewrite cycle.
+        harbor_jobs.resume(
+            harbor_job.job_dir, filter_error_types=[CANCELLED_ERROR_TYPE],
+            job_plugin=[PAUSE_PLUGIN],
+        )
+        assert created == []
+        update_parent(harbor_job.job_dir, "new-parent-2")
+        update_endpoint(harbor_job.job_dir, "http://203.0.113.21:9000")
+    request.unlink()
     harbor_jobs.resume(
         harbor_job.job_dir, filter_error_types=[CANCELLED_ERROR_TYPE],
         job_plugin=[PAUSE_PLUGIN],
     )
     assert set(created) == {"running", "pending-a", "pending-b"}
-    assert (harbor_job.job_dir / finished.trial_name / "result.json").read_bytes() == completed_bytes
+    after = (harbor_job.job_dir / finished.trial_name / "result.json").read_bytes()
+    if prepare_metadata:
+        old, new = json.loads(completed_bytes), json.loads(after)
+        config = new.pop("config")
+        old.pop("config")
+        assert new == old  # Preserve completed results, identity, and timings.
+        assert config["environment"]["kwargs"]["persistent_env"]["HARBOR_PARENT"] == "new-parent-2"
+        assert config["agent"]["env"]["OPENAI_BASE_URL"] == "http://203.0.113.21:9000/v1"
+    else:
+        assert after == completed_bytes
 
 
 def test_request_before_scheduling_creates_no_trials(harbor_job, tmp_path, monkeypatch):

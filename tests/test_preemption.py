@@ -472,6 +472,7 @@ def test_paused_resume_command_reuses_original_artifact_and_placeholder():
     command = api._build_pause_resume_command({
         "job_id": "abc",
         "job_name": "foo--resume",
+        "command": ["bash", "-c", "uv run harbor jobs resume -p /app/jobs/foo"],
         "server_url": "nebius-b200",
         "preempt_attempts": 2,
     })
@@ -482,8 +483,8 @@ def test_paused_resume_command_reuses_original_artifact_and_placeholder():
     assert "s3://results/foo/" in shell  # original artifact, not foo--resume
     assert "/app/jobs/foo" in shell
     assert "foo/abc-p2" in shell  # per-attempt staging prefix
-    assert "HARBOR_PARENT" in shell  # parent step the worker extends with the URL rewrite
-    assert "Replaced URL" not in shell  # new-IP rewrite is injected by the worker, not baked in
+    assert "coding_agent_bench.resume parent" in shell
+    assert "coding_agent_bench.resume endpoint" not in shell  # injected after provisioning
 
 
 def test_process_queued_job_routes_preemption_to_pause(monkeypatch):
